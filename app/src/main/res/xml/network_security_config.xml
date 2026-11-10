@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Home Assistant usually runs on the local network over plain http (http://192.168.x.x:8123), and Android
+  can't scope cleartext permission to private IP ranges, so cleartext is allowed. Web search, weather and
+  the other built-in services use https.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">duckduckgo.com</domain>
+        <domain includeSubdomains="true">open-meteo.com</domain>
+        <domain includeSubdomains="true">wikipedia.org</domain>
+        <domain includeSubdomains="true">wikimedia.org</domain>
+        <domain includeSubdomains="true">huggingface.co</domain>
+    </domain-config>
+</network-security-config>

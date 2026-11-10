@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep Cosmic Pitch Background -->
+    <path
+        android:fillColor="#080716"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Outer Nebula Halo Ring -->
+    <path
+        android:fillColor="#333B82F6"
+        android:pathData="M54,18C74.5,18 90,33.5 90,54C90,74.5 74.5,90 54,90C33.5,90 18,74.5 18,54C18,33.5 33.5,18 54,18Z" />
+    <!-- Biomorphic Lobe 1 (Violet) -->
+    <path
+        android:fillColor="#AA8B5CF6"
+        android:strokeColor="#A78BFA"
+        android:strokeWidth="1.6"
+        android:pathData="M54,24C70,22 84,36 82,53C80,70 69,84 52,82C35,80 23,68 25,51C27,34 38,26 54,24Z" />
+    <!-- Biomorphic Lobe 2 (Mint-Cyan Offset) -->
+    <path
+        android:fillColor="#881E1B4B"
+        android:strokeColor="#5EEAD4"
+        android:strokeWidth="1.8"
+        android:pathData="M57,27C73,29 81,43 78,58C75,73 60,81 45,78C30,75 26,60 29,45C32,30 41,25 57,27Z" />
+    <!-- Inner Nebula Core -->
+    <path
+        android:fillColor="#1E1B4B"
+        android:pathData="M54,34C65,34 74,43 74,54C74,65 65,74 54,74C43,74 34,65 34,54C34,43 43,34 54,34Z" />
+    <!-- Starfield Sparkles -->
+    <path
+        android:fillColor="#5EEAD4"
+        android:pathData="M54,42L56.5,51.5L66,54L56.5,56.5L54,66L51.5,56.5L42,54L51.5,51.5Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M65,39C66.2,39 67,39.8 67,41C67,42.2 66.2,43 65,43C63.8,43 63,42.2 63,41C63,39.8 63.8,39 65,39Z" />
+    <path
+        android:fillColor="#A78BFA"
+        android:pathData="M43,64C44,64 44.8,64.8 44.8,65.8C44.8,66.8 44,67.6 43,67.6C42,67.6 41.2,66.8 41.2,65.8C41.2,64.8 42,64 43,64Z" />
+</vector>

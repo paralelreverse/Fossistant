@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep Crimson Obsidian Background -->
+    <path
+        android:fillColor="#18040A"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Outer Ruby Halo -->
+    <path
+        android:fillColor="#33EF4444"
+        android:pathData="M54,18C74.5,18 90,33.5 90,54C90,74.5 74.5,90 54,90C33.5,90 18,74.5 18,54C18,33.5 33.5,18 54,18Z" />
+    <!-- Biomorphic Flame Lobe 1 (Ruby Rose) -->
+    <path
+        android:fillColor="#AABE123C"
+        android:strokeColor="#FB7185"
+        android:strokeWidth="1.7"
+        android:pathData="M54,21C72,24 85,38 81,56C77,74 66,85 49,82C32,79 22,65 26,48C30,31 36,18 54,21Z" />
+    <!-- Biomorphic Lobe 2 (Amber Gold) -->
+    <path
+        android:fillColor="#883B0A18"
+        android:strokeColor="#FBBF24"
+        android:strokeWidth="1.8"
+        android:pathData="M50,27C67,25 80,39 78,55C76,71 63,81 47,79C31,77 25,63 28,47C31,31 33,29 50,27Z" />
+    <!-- Inner Ember Core -->
+    <path
+        android:fillColor="#3B0A18"
+        android:pathData="M54,34C65,34 74,43 74,54C74,65 65,74 54,74C43,74 34,65 34,54C34,43 43,34 54,34Z" />
+    <!-- Ember Star Core -->
+    <path
+        android:fillColor="#FBBF24"
+        android:pathData="M54,41L57,51L67,54L57,57L54,67L51,57L41,54L51,51Z" />
+    <path
+        android:fillColor="#FB7185"
+        android:pathData="M65,40C66.3,40 67.3,41 67.3,42.3C67.3,43.6 66.3,44.6 65,44.6C63.7,44.6 62.7,43.6 62.7,42.3C62.7,41 63.7,40 65,40Z" />
+</vector>

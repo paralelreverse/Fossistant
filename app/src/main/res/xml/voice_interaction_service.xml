@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="org.fossistant.assistant.service.FossistantVoiceInteractionSessionService"
+    android:recognitionService="org.fossistant.assistant.service.FossistantRecognitionService"
+    android:settingsActivity="org.fossistant.assistant.ui.MainActivity"
+    android:supportsAssist="true"
+    android:supportsLaunchVoiceAssistFromKeyguard="true"
+    android:supportsLocalInteraction="true" />

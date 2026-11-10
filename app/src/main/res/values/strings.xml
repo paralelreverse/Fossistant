@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fossistant</string>
+    <string name="agent_accessibility_label">Fossistant Device Control Agent</string>
+    <string name="widget_label">Ask Fossistant</string>
+    <string name="widget_description">Opens the voice assistant</string>
+    <string name="tile_label">Fossistant</string>
+    <string name="share_label">Ask Fossistant</string>
+    <string name="agent_accessibility_description">Allows Fossistant to execute on-device agent tasks, read screen context, click buttons, and automate apps locally.</string>
+
+    <style name="Theme.Fossistant.Overlay" parent="@android:style/Theme.DeviceDefault.NoActionBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

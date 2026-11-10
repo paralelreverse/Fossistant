@@ -1,0 +1,24 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/app/build/
+/captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.tmp
+/models/
+*.new
+/third_party/
+
+# Kotlin compiler caches
+.kotlin/
+
+# Release signing (never commit)
+keystore.properties
+*.jks
+*.keystore

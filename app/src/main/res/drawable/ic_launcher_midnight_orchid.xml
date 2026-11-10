@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Deep Orchid Night Background -->
+    <path
+        android:fillColor="#1A051D"
+        android:pathData="M0,0h108v108h-108z" />
+    <!-- Outer Magenta Halo -->
+    <path
+        android:fillColor="#33C084FC"
+        android:pathData="M54,18C74.5,18 90,33.5 90,54C90,74.5 74.5,90 54,90C33.5,90 18,74.5 18,54C18,33.5 33.5,18 54,18Z" />
+    <!-- Biomorphic Orchid Lobe 1 (Magenta) -->
+    <path
+        android:fillColor="#AA86198F"
+        android:strokeColor="#E879F9"
+        android:strokeWidth="1.7"
+        android:pathData="M55,22C72,24 85,38 82,55C79,72 65,84 48,81C31,78 23,64 26,47C29,30 38,20 55,22Z" />
+    <!-- Biomorphic Lobe 2 (Sakura Pink) -->
+    <path
+        android:fillColor="#88340B38"
+        android:strokeColor="#F472B6"
+        android:strokeWidth="1.8"
+        android:pathData="M52,26C68,25 80,39 78,55C76,71 63,81 47,79C31,77 25,62 28,46C31,30 36,27 52,26Z" />
+    <!-- Inner Orchid Core -->
+    <path
+        android:fillColor="#340B38"
+        android:pathData="M54,34C65,34 74,43 74,54C74,65 65,74 54,74C43,74 34,65 34,54C34,43 43,34 54,34Z" />
+    <!-- Orchid Star -->
+    <path
+        android:fillColor="#F472B6"
+        android:pathData="M54,41L56.8,51.2L67,54L56.8,56.8L54,67L51.2,56.8L41,54L51.2,51.2Z" />
+</vector>

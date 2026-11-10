@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Camera photos for chat attachments -->
+    <cache-path name="camera" path="camera/" />
+    <!-- Pictures made on the phone with Stable Diffusion, opened in the gallery viewer -->
+    <files-path name="generated_images" path="generated_images/" />
+</paths>
