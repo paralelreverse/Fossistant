@@ -66,7 +66,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.fossistant.assistant.model.ToolExecutionResult
 import org.fossistant.assistant.model.ToolVisual
@@ -150,6 +149,7 @@ private fun BarChart(visual: ToolVisual) {
     val values = visual.values
     if (values.isEmpty()) return
     val measurer = rememberTextMeasurer()
+    val barPath = remember { Path() }
     Canvas(Modifier.fillMaxWidth().height(BAR_ROW * values.size)) {
         val gap = 6.dp.toPx()
         val row = BAR_ROW.toPx()
@@ -176,7 +176,7 @@ private fun BarChart(visual: ToolVisual) {
             drawText(label, topLeft = Offset(0f, centerY - label.size.height / 2f))
             val length = (abs(value) / span * plotWidth).toFloat()
             val start = if (value >= 0) zeroX else zeroX - length
-            drawBar(start, centerY - thickness / 2, length, thickness, growsRight = value >= 0)
+            drawBar(start, centerY - thickness / 2, length, thickness, growsRight = value >= 0, path = barPath)
             val text = valueLayouts[i]
             val x = if (value >= 0) zeroX + length + gap else zeroX - length - gap - text.size.width
             drawText(text, topLeft = Offset(x, centerY - text.size.height / 2f))
@@ -186,7 +186,7 @@ private fun BarChart(visual: ToolVisual) {
 }
 
 /** A bar with a 4 dp rounded data end and a square end at the baseline. */
-private fun DrawScope.drawBar(start: Float, top: Float, length: Float, thickness: Float, growsRight: Boolean) {
+private fun DrawScope.drawBar(start: Float, top: Float, length: Float, thickness: Float, growsRight: Boolean, path: Path) {
     if (length <= 0f) return
     val r = minOf(4.dp.toPx(), length / 2, thickness / 2)
     val round = CornerRadius(r, r)
@@ -197,7 +197,9 @@ private fun DrawScope.drawBar(start: Float, top: Float, length: Float, thickness
         bottomRightCornerRadius = if (growsRight) round else CornerRadius.Zero,
         bottomLeftCornerRadius = if (growsRight) CornerRadius.Zero else round
     )
-    drawPath(Path().apply { addRoundRect(rect) }, SERIES[0])
+    path.reset()
+    path.addRoundRect(rect)
+    drawPath(path, SERIES[0])
 }
 
 /** A 2 dp line over a light wash with clean y ticks; tapping a point shows its label and value. */
@@ -526,7 +528,7 @@ private object RemoteImages {
     private const val MAX_SIDE_PX = 512
     private const val USER_AGENT = "Mozilla/5.0 (Android 15; Mobile; rv:130.0) Gecko/130.0 Firefox/130.0"
 
-    private val client = OkHttpClient.Builder()
+    private val client = org.fossistant.assistant.util.SharedHttp.client.newBuilder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .build()

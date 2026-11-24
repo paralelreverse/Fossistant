@@ -3,7 +3,6 @@ package org.fossistant.assistant
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
 import org.fossistant.assistant.engine.AiMemoryManager
-import org.fossistant.assistant.engine.DualModelRouter
 import org.fossistant.assistant.engine.FastMultilingualTtsEngine
 import org.fossistant.assistant.engine.GemmaLiteRtEngine
 import org.fossistant.assistant.engine.MultimodalChunkProcessor
@@ -14,18 +13,20 @@ import org.fossistant.assistant.model.MediaModality
 import org.fossistant.assistant.model.ModelTier
 import org.fossistant.assistant.model.ResponseLengthPreference
 import org.fossistant.assistant.model.SupportedLanguage
+import org.fossistant.assistant.model.ToolCallRequest
 import org.fossistant.assistant.model.WhisperModelChoice
 import org.fossistant.assistant.tools.DeviceAndWebToolExecutor
 import org.fossistant.assistant.tools.FuzzyAppAndCommandMatcher
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.nio.file.Files
 
-class DualModelRouterTest {
+class GemmaTurnAndAppMatcherTest {
 
     private val tempMemoryDir = Files.createTempDirectory("fossistant_mem_test").toFile().apply { deleteOnExit() }
     private val memoryManager = AiMemoryManager(storageDir = tempMemoryDir)
@@ -37,30 +38,24 @@ class DualModelRouterTest {
         chunkProcessor = chunkProcessor,
         memoryManager = memoryManager
     )
-    private val router = DualModelRouter(
-        gemmaEngine = gemmaEngine,
-        toolExecutor = toolExecutor
-    )
 
     @Test
-    fun `on-device AI memory system extracts, persists, and recalls user facts across turns`() = runTest {
+    fun `on-device AI memory system persists and recalls stored user facts without per-turn regex writes`() = runTest {
         memoryManager.clearAll()
 
-        // Turn 1: User shares personal facts naturally in conversation
-        router.processUserTurn("My name is Lukas and I live in Warsaw").toList()
-        router.processUserTurn("Remember that my favorite programming language is Kotlin").toList()
+        // Casual messages no longer auto-write to memory via regex on every turn.
+        gemmaEngine.processUserTurn("Hey, what's up? Give it a call later").toList()
+        assertTrue(memoryManager.facts.value.isEmpty())
 
-        val storedFacts = memoryManager.facts.value
-        assertTrue("Expected at least 2 extracted facts, got: $storedFacts", storedFacts.size >= 2)
-        assertTrue(storedFacts.any { it.fact.contains("Lukas", ignoreCase = true) })
-        assertTrue(storedFacts.any { it.fact.contains("Kotlin", ignoreCase = true) })
+        // Stored facts persist and are recalled.
+        memoryManager.rememberFact("User's name is Lukas", "IDENTITY")
+        memoryManager.rememberFact("User lives in Warsaw", "LOCATION")
+        memoryManager.rememberFact("User's favorite programming language is Kotlin", "PREFERENCE")
 
-        // Verify persistence by reloading a fresh AiMemoryManager instance from the same directory
         val reloadedManager = AiMemoryManager(storageDir = tempMemoryDir)
-        assertEquals(storedFacts.size, reloadedManager.facts.value.size)
+        assertEquals(3, reloadedManager.facts.value.size)
 
-        // Turn 2: Ask the model what it remembers
-        val recallEmissions = router.processUserTurn("What do you remember about my name and my favorite programming language?").toList()
+        val recallEmissions = gemmaEngine.processUserTurn("What do you remember about my name and my favorite programming language?").toList()
         val finalAnswer = recallEmissions.last().text
         assertTrue("Expected recalled fact 'Lukas' in response: $finalAnswer", finalAnswer.contains("Lukas"))
         assertTrue("Expected recalled fact 'Kotlin' in response: $finalAnswer", finalAnswer.contains("Kotlin"))
@@ -92,7 +87,6 @@ class DualModelRouterTest {
     fun `blob mood themes, AI character personas, and shorter or longer response preferences customize output`() = runTest {
         assertTrue("Expected at least 6 blob mood themes", BlobMoodTheme.entries.size >= 6)
 
-        // Test SHORTER + SHARP_TECHNICAL customization
         gemmaEngine.updateCustomization(
             persona = AiCharacterPersona.SHARP_TECHNICAL,
             lengthPref = ResponseLengthPreference.SHORTER
@@ -101,14 +95,13 @@ class DualModelRouterTest {
         assertTrue(shorterPromptSys.startsWith("<|think|>"))
         assertTrue(shorterPromptSys.contains("1 to 2 sentences maximum"))
 
-        val shortReply = router.processUserTurn("Tell me about quantum computing").toList().last().text
+        val shortReply = gemmaEngine.processUserTurn("Tell me about quantum computing").toList().last().text
 
-        // Test LONGER + EMPATHETIC_COMPANION customization
         gemmaEngine.updateCustomization(
             persona = AiCharacterPersona.EMPATHETIC_COMPANION,
             lengthPref = ResponseLengthPreference.LONGER
         )
-        val longReply = router.processUserTurn("Tell me about quantum computing").toList().last().text
+        val longReply = gemmaEngine.processUserTurn("Tell me about quantum computing").toList().last().text
 
         assertTrue(
             "Expected LONGER response (${longReply.length} chars) to be longer than SHORTER response (${shortReply.length} chars)",
@@ -116,10 +109,6 @@ class DualModelRouterTest {
         )
     }
 
-    /**
-     * Gemma ships in the full APK split into `gemma-4-E2B-it.partN.litertlm` (assets over 2 GB can't be packaged);
-     * the app joins them when it unpacks. Total size of the parts in the project, or 0.
-     */
     private fun bundledGemmaBytes(): Long =
         listOf(File("app/src/full/assets/models"), File("src/full/assets/models"))
             .firstOrNull { it.isDirectory }
@@ -158,7 +147,7 @@ class DualModelRouterTest {
             sizeBytes = largeDoc.length.toLong(),
             extractedTextPreview = largeDoc
         )
-        val emissions = router.processUserTurn("Summarize the Multi-Token Prediction section", listOf(attachment)).toList()
+        val emissions = gemmaEngine.processUserTurn("Summarize the Multi-Token Prediction section", listOf(attachment)).toList()
         val finalMsg = emissions.last()
         assertEquals(ModelTier.GEMMA_E2B_QAT_MTP, finalMsg.modelTier)
         assertTrue(finalMsg.text.contains("Multi-Token Prediction"))
@@ -187,9 +176,8 @@ class DualModelRouterTest {
             "Make a reservation at Olive Garden" to "transactional_action"
         )
 
-        // Gemma picks the tool from the request (in any language); here we check every tool still exists.
         for ((prompt, tool) in testCases) {
-            val result = toolExecutor.execute(org.fossistant.assistant.model.ToolCallRequest(tool))
+            val result = toolExecutor.execute(ToolCallRequest(tool))
             assertFalse("'$tool' (for '$prompt') is no longer a tool: ${result.summary}", result.summary.startsWith("Unknown tool"))
             assertTrue("Expected non-blank summary for '$tool'", result.summary.isNotBlank())
         }
@@ -213,22 +201,21 @@ class DualModelRouterTest {
         assertTrue(streamingThink.isStillThinking)
         assertEquals("Thinking...", streamingThink.visibleAnswer)
 
-        // With thinking on, LiteRT sends the thoughts in their own channel: untagged message text is the answer.
         val channelAnswer = gemmaEngine.splitGemmaReasoningAndAnswer(rawOutput = "Kotlin, Python and more.", enableThinking = true)
         assertFalse(channelAnswer.isStillThinking)
         assertEquals("Kotlin, Python and more.", channelAnswer.visibleAnswer)
 
-        val reply = router.processUserTurn("Explain quantum entanglement simply").toList().last()
+        val reply = gemmaEngine.processUserTurn("Explain quantum entanglement simply").toList().last()
         assertFalse("Placeholder must never be emitted", reply.text.contains("I'm right here with you. Regarding"))
     }
 
     @Test
     fun `conversational greetings and capabilities generate real helpful responses without debug text`() = runTest {
-        val helloTurn = router.processUserTurn("hello").toList().last()
+        val helloTurn = gemmaEngine.processUserTurn("hello").toList().last()
         assertTrue(helloTurn.text.contains("Hello") || helloTurn.text.contains("Fossistant"))
         assertFalse(helloTurn.text.contains("processed your request"))
 
-        val capabilitiesTurn = router.processUserTurn("what can you do").toList().last()
+        val capabilitiesTurn = gemmaEngine.processUserTurn("what can you do").toList().last()
         assertTrue(capabilitiesTurn.text.contains("Open any installed app") || capabilitiesTurn.text.contains("alarms"))
         assertFalse(capabilitiesTurn.text.contains("processed your request"))
     }
@@ -239,12 +226,12 @@ class DualModelRouterTest {
         assertNotNull("Expected whisper-tiny.bin (the default) to resolve", stt.resolveOrExtractModelFile())
         assertNotNull(
             "Expected whisper-small-q5_1.bin to resolve",
-            stt.resolveOrExtractModelFile(org.fossistant.assistant.model.WhisperModelChoice.WHISPER_SMALL_Q5)
+            stt.resolveOrExtractModelFile(WhisperModelChoice.WHISPER_SMALL_Q5)
         )
         assertEquals("What time is it?", stt.cleanWhisperArtifacts(" [BLANK_AUDIO] What time is it? (inaudible) "))
 
         val silentSamples = ShortArray(1024) { 4 }
-        val (silentDb, silentNorm) = stt.computePcmLevels(silentSamples, silentSamples.size)
+        val (_, silentNorm) = stt.computePcmLevels(silentSamples, silentSamples.size)
         assertEquals(0f, silentNorm, 0.01f)
 
         val speechSamples = ShortArray(1024) { idx -> if (idx % 2 == 0) 4200 else -4200 }
@@ -272,11 +259,10 @@ class DualModelRouterTest {
         assertTrue(sysPrompt.contains("You are Nova"))
         assertTrue(sysPrompt.contains("Always greet me as Captain."))
 
-        val greetingTurn = router.processUserTurn("hello").toList().last()
+        val greetingTurn = gemmaEngine.processUserTurn("hello").toList().last()
         assertTrue("Expected greeting to use custom AI name Nova, got: ${greetingTurn.text}", greetingTurn.text.contains("Nova"))
 
-        // Verify all 6 BlobMoodTheme styles map to distinct custom launcher icon resources
-        val iconResIds = org.fossistant.assistant.model.BlobMoodTheme.entries.map { theme ->
+        val iconResIds = BlobMoodTheme.entries.map { theme ->
             org.fossistant.assistant.ui.AppIconSwitcher.drawableResForTheme(theme)
         }.toSet()
         assertEquals(6, iconResIds.size)
@@ -289,71 +275,82 @@ class DualModelRouterTest {
         assertTrue(bundledGemmaBytes() > 1_500_000_000L)
 
         val gemmaSys = gemmaEngine.buildSystemPromptText(enableThinking = true)
-        assertTrue(gemmaSys.contains("Gemma 4 E2B"))
+        assertTrue(gemmaSys.contains("on-device Android assistant"))
+        assertFalse("no model or vendor name: it only costs tokens", gemmaSys.contains("Google"))
 
-        val gemmaTurn = router.processUserTurn("Explain the laws of physics simply").toList().last()
+        val gemmaTurn = gemmaEngine.processUserTurn("Explain the laws of physics simply").toList().last()
         assertEquals(ModelTier.GEMMA_E2B_QAT_MTP, gemmaTurn.modelTier)
         assertTrue(gemmaTurn.text.isNotBlank())
     }
 
     @Test
-    fun `FuzzyAppAndCommandMatcher autocorrects phonetic speech mishearings and matches apps`() {
-        // Test phonetic mishearing corrections
+    fun `FuzzyAppAndCommandMatcher matches explicit app names without corrupting normal speech`() {
         val correctedFast = FuzzyAppAndCommandMatcher.autocorrectTranscript("open fast assistent please")
-        assertTrue("Expected 'Fossistant' in '$correctedFast'", correctedFast.contains("Fossistant", ignoreCase = true))
+        assertTrue("Expected 'fossistant' in '$correctedFast'", correctedFast.contains("fossistant", ignoreCase = true))
 
         val correctedSpotfy = FuzzyAppAndCommandMatcher.autocorrectTranscript("play jazz on spotfy")
         assertTrue("Expected 'spotify' in '$correctedSpotfy'", correctedSpotfy.contains("spotify", ignoreCase = true))
 
-        val correctedFlash = FuzzyAppAndCommandMatcher.autocorrectTranscript("turn on flash lite")
-        assertTrue("Expected 'flashlight' in '$correctedFlash'", correctedFlash.contains("flashlight", ignoreCase = true))
-
         val correctedOsm = FuzzyAppAndCommandMatcher.autocorrectTranscript("open osm& and navigate")
         assertTrue("Expected 'osmand' in '$correctedOsm'", correctedOsm.contains("osmand", ignoreCase = true))
 
-        // Test Levenshtein distance
-        val dist1 = FuzzyAppAndCommandMatcher.levenshteinDistance("spotify", "spotfy")
-        assertEquals(1, dist1)
+        // Unrelated words and sentences must not be rewritten into app/tool names.
+        assertEquals("turn on flash lite", FuzzyAppAndCommandMatcher.autocorrectTranscript("turn on flash lite"))
+        assertEquals("hey what's up", FuzzyAppAndCommandMatcher.autocorrectTranscript("hey what's up"))
+        assertEquals("send a message", FuzzyAppAndCommandMatcher.autocorrectTranscript("send a message"))
+        assertEquals("cam", FuzzyAppAndCommandMatcher.autocorrectTranscript("cam"))
 
-        val dist2 = FuzzyAppAndCommandMatcher.levenshteinDistance("fossistant", "fastassistent")
-        assertTrue(dist2 < 6)
+        assertEquals(1, FuzzyAppAndCommandMatcher.levenshteinDistance("spotify", "spotfy"))
 
-        // Test closest app candidate matching
         val candidates = listOf(
             FuzzyAppAndCommandMatcher.AppMatchCandidate("Fossistant", "org.fossistant.assistant"),
             FuzzyAppAndCommandMatcher.AppMatchCandidate("Spotify", "com.spotify.music"),
             FuzzyAppAndCommandMatcher.AppMatchCandidate("WhatsApp", "com.whatsapp"),
             FuzzyAppAndCommandMatcher.AppMatchCandidate("OsmAnd", "net.osmand"),
-            FuzzyAppAndCommandMatcher.AppMatchCandidate("Google Maps", "com.google.android.apps.maps")
+            FuzzyAppAndCommandMatcher.AppMatchCandidate("Google Maps", "com.google.android.apps.maps"),
+            FuzzyAppAndCommandMatcher.AppMatchCandidate("Notes", "org.example.notes")
         )
 
-        val matchFastAssistant = FuzzyAppAndCommandMatcher.findBestMatchCandidate("fast assistent", candidates)
-        assertNotNull(matchFastAssistant)
-        assertEquals("org.fossistant.assistant", matchFastAssistant?.packageName)
+        assertEquals("org.fossistant.assistant", FuzzyAppAndCommandMatcher.findBestMatchCandidate("fast assistent", candidates)?.packageName)
+        assertEquals("com.spotify.music", FuzzyAppAndCommandMatcher.findBestMatchCandidate("Spotify", candidates)?.packageName)
+        assertEquals("com.spotify.music", FuzzyAppAndCommandMatcher.findBestMatchCandidate("spotfy", candidates)?.packageName)
+        assertEquals("net.osmand", FuzzyAppAndCommandMatcher.findBestMatchCandidate("osm&", candidates)?.packageName)
+        assertEquals("com.google.android.apps.maps", FuzzyAppAndCommandMatcher.findBestMatchCandidate("Google Maps", candidates)?.packageName)
+        assertEquals("com.google.android.apps.maps", FuzzyAppAndCommandMatcher.findBestMatchCandidate("maps", candidates)?.packageName)
 
-        val matchSpotfy = FuzzyAppAndCommandMatcher.findBestMatchCandidate("spotfy", candidates)
-        assertNotNull(matchSpotfy)
-        assertEquals("com.spotify.music", matchSpotfy?.packageName)
+        // Casual phrases and unrelated words must be rejected instead of matching an arbitrary app.
+        assertNull(FuzzyAppAndCommandMatcher.findBestMatchCandidate("hey what's up", candidates))
+        assertNull(FuzzyAppAndCommandMatcher.findBestMatchCandidate("send a message", candidates))
+        assertNull(FuzzyAppAndCommandMatcher.findBestMatchCandidate("cam", candidates))
+        assertNull(FuzzyAppAndCommandMatcher.findBestMatchCandidate("random unrelated phrase", candidates))
+        assertNull(FuzzyAppAndCommandMatcher.findBestMatchCandidate("read my random notes today", candidates))
+    }
 
-        val matchOsmAnd = FuzzyAppAndCommandMatcher.findBestMatchCandidate("osm&", candidates)
-        assertNotNull(matchOsmAnd)
-        assertEquals("net.osmand", matchOsmAnd?.packageName)
+    @Test
+    fun `fuzzy app matching resolves typos, punctuation, and app suffix`() {
+        val candidates = listOf(
+            FuzzyAppAndCommandMatcher.AppMatchCandidate("Photos", "com.google.android.apps.photos"),
+            FuzzyAppAndCommandMatcher.AppMatchCandidate("Spotify", "com.spotify.music"),
+            FuzzyAppAndCommandMatcher.AppMatchCandidate("Fossistant", "org.fossistant.assistant"),
+            FuzzyAppAndCommandMatcher.AppMatchCandidate("Gallery", "com.simplemobiletools.gallery"),
+            FuzzyAppAndCommandMatcher.AppMatchCandidate("OsmAnd", "net.osmand")
+        )
 
-        val matchMaps = FuzzyAppAndCommandMatcher.findBestMatchCandidate("maps", candidates)
-        assertNotNull(matchMaps)
-        assertEquals("com.google.android.apps.maps", matchMaps?.packageName)
+        assertEquals("Photos", FuzzyAppAndCommandMatcher.findBestMatchCandidate("open phptos app.", candidates)?.label)
+        assertEquals("Photos", FuzzyAppAndCommandMatcher.findBestMatchCandidate("opem photos app.", candidates)?.label)
+        assertEquals("Fossistant", FuzzyAppAndCommandMatcher.findBestMatchCandidate("open fast assistent", candidates)?.label)
+        assertEquals("Spotify", FuzzyAppAndCommandMatcher.findBestMatchCandidate("spotfy", candidates)?.label)
+        assertEquals("Gallery", FuzzyAppAndCommandMatcher.findBestMatchCandidate("open gallary app", candidates)?.label)
+        assertEquals("OsmAnd", FuzzyAppAndCommandMatcher.findBestMatchCandidate("osm&", candidates)?.label)
     }
 
     @Test
     fun `Whisper Tiny and Small Q5 exist and resolve valid files`() {
         val stt = org.fossistant.assistant.engine.WhisperMultilingualSttEngine(context = null)
-
-        // Whisper Tiny (the fast default) and Whisper Small Q5 (more accurate)
         val choices = WhisperModelChoice.entries
         assertEquals(listOf(WhisperModelChoice.WHISPER_TINY, WhisperModelChoice.WHISPER_SMALL_Q5), choices)
         assertEquals(WhisperModelChoice.WHISPER_TINY, stt.activeModel)
 
-        // Verify each model file resolves in assets/models
         for (choice in choices) {
             val file = stt.resolveOrExtractModelFile(choice)
             assertNotNull("Expected ${choice.filename} to resolve on disk", file)
@@ -365,7 +362,6 @@ class DualModelRouterTest {
 
     @Test
     fun `direct phone calling and SMS tool execution return proper status`() {
-        // In test mode (context = null), direct calling and SMS gracefully simulate success
         val callResult = toolExecutor.makePhoneCall("Mom")
         assertTrue(callResult.success)
         assertEquals("make_call", callResult.toolName)
@@ -385,57 +381,16 @@ class DualModelRouterTest {
     }
 
     @Test
-    fun `fuzzy app matching resolves typos, punctuation, and app suffix`() {
-        val candidates = listOf(
-            FuzzyAppAndCommandMatcher.AppMatchCandidate("Photos", "com.google.android.apps.photos"),
-            FuzzyAppAndCommandMatcher.AppMatchCandidate("Spotify", "com.spotify.music"),
-            FuzzyAppAndCommandMatcher.AppMatchCandidate("Fossistant", "org.fossistant.assistant"),
-            FuzzyAppAndCommandMatcher.AppMatchCandidate("Gallery", "com.simplemobiletools.gallery"),
-            FuzzyAppAndCommandMatcher.AppMatchCandidate("OsmAnd", "net.osmand")
-        )
-
-        // 1. "open phptos app." -> Photos
-        val match1 = FuzzyAppAndCommandMatcher.findBestMatchCandidate("open phptos app.", candidates)
-        assertNotNull("Expected match for 'open phptos app.'", match1)
-        assertEquals("Photos", match1!!.label)
-
-        // 2. "opem photos app." -> Photos
-        val match2 = FuzzyAppAndCommandMatcher.findBestMatchCandidate("opem photos app.", candidates)
-        assertNotNull("Expected match for 'opem photos app.'", match2)
-        assertEquals("Photos", match2!!.label)
-
-        // 3. "open fast assistent" -> Fossistant
-        val match3 = FuzzyAppAndCommandMatcher.findBestMatchCandidate("open fast assistent", candidates)
-        assertNotNull("Expected match for 'open fast assistent'", match3)
-        assertEquals("Fossistant", match3!!.label)
-
-        // 4. "spotfy" -> Spotify
-        val match4 = FuzzyAppAndCommandMatcher.findBestMatchCandidate("spotfy", candidates)
-        assertNotNull("Expected match for 'spotfy'", match4)
-        assertEquals("Spotify", match4!!.label)
-
-        // 5. "open gallary app" -> Gallery
-        val match5 = FuzzyAppAndCommandMatcher.findBestMatchCandidate("open gallary app", candidates)
-        assertNotNull("Expected match for 'open gallary app'", match5)
-        assertEquals("Gallery", match5!!.label)
-
-        // 6. "osm&" -> OsmAnd
-        val match6 = FuzzyAppAndCommandMatcher.findBestMatchCandidate("osm&", candidates)
-        assertNotNull("Expected match for 'osm&'", match6)
-        assertEquals("OsmAnd", match6!!.label)
-    }
-
-    @Test
     fun `every command goes to Gemma, in any language`() = runTest {
         for (prompt in listOf("Play Daft Punk on Spotify", "Stell einen Wecker auf 7 Uhr", "otwórz zdjęcia")) {
-            val finalMsg = router.processUserTurn(prompt).toList().last()
+            val finalMsg = gemmaEngine.processUserTurn(prompt).toList().last()
             assertEquals(prompt, ModelTier.GEMMA_E2B_QAT_MTP, finalMsg.modelTier)
         }
     }
 
     @Test
     fun `reasoning toggle ON runs Gemma with think token and reasoning phase`() = runTest {
-        val emissions = router.processUserTurn(
+        val emissions = gemmaEngine.processUserTurn(
             prompt = "Play Daft Punk on Spotify",
             enableReasoning = true
         ).toList()
@@ -461,29 +416,28 @@ class DualModelRouterTest {
     @Test
     fun `confirmation understands yes and no in other languages`() = runTest {
         val pending = org.fossistant.assistant.engine.PendingConfirmation(
-            org.fossistant.assistant.model.ToolCallRequest("set_flashlight", mapOf("enabled" to "true")),
+            ToolCallRequest("set_flashlight", mapOf("enabled" to "true")),
             "Turn on the flashlight"
         )
         for (yes in listOf("Ja, bitte", "oui", "tak", "да")) {
             gemmaEngine.pendingConfirmation = pending
-            val confirmed = router.processUserTurn(yes).toList().last()
+            val confirmed = gemmaEngine.processUserTurn(yes).toList().last()
             assertEquals(yes, ModelTier.DIRECT_ACTION, confirmed.modelTier)
             assertEquals(yes, "set_flashlight", confirmed.toolExecutions.firstOrNull()?.toolName)
         }
         for (no in listOf("Nein", "nie", "нет")) {
             gemmaEngine.pendingConfirmation = pending
-            val declined = router.processUserTurn(no).toList().last()
+            val declined = gemmaEngine.processUserTurn(no).toList().last()
             assertEquals(no, ModelTier.DIRECT_ACTION, declined.modelTier)
             assertTrue(no, declined.toolExecutions.isEmpty())
         }
-        // "Japan" is not "ja": the pending action is dropped and the request goes to Gemma
         gemmaEngine.pendingConfirmation = pending
-        assertEquals(ModelTier.GEMMA_E2B_QAT_MTP, router.processUserTurn("Japan weather").toList().last().modelTier)
+        assertEquals(ModelTier.GEMMA_E2B_QAT_MTP, gemmaEngine.processUserTurn("Japan weather").toList().last().modelTier)
     }
 
     @Test
     fun `actions Gemma has not confirmed are never executed`() = runTest {
-        val finalMsg = router.processUserTurn("Remind me to call Dr. Smith next Tuesday after lunch").toList().last()
+        val finalMsg = gemmaEngine.processUserTurn("Remind me to call Dr. Smith next Tuesday after lunch").toList().last()
         assertEquals(ModelTier.GEMMA_E2B_QAT_MTP, finalMsg.modelTier)
         assertTrue("Unconfirmed actions must not run, got ${finalMsg.toolExecutions.map { it.toolName }}", finalMsg.toolExecutions.isEmpty())
     }
@@ -491,22 +445,21 @@ class DualModelRouterTest {
     @Test
     fun `call proposed by Gemma runs only after the user says yes`() = runTest {
         val pending = org.fossistant.assistant.engine.PendingConfirmation(
-            org.fossistant.assistant.model.ToolCallRequest("set_flashlight", mapOf("enabled" to "true")),
+            ToolCallRequest("set_flashlight", mapOf("enabled" to "true")),
             "Turn on the flashlight"
         )
         gemmaEngine.pendingConfirmation = pending
-        val confirmed = router.processUserTurn("Yes please").toList().last()
+        val confirmed = gemmaEngine.processUserTurn("Yes please").toList().last()
         assertEquals("set_flashlight", confirmed.toolExecutions.firstOrNull()?.toolName)
         assertEquals(null, gemmaEngine.pendingConfirmation)
 
         gemmaEngine.pendingConfirmation = pending
-        val declined = router.processUserTurn("No, don't").toList().last()
+        val declined = gemmaEngine.processUserTurn("No, don't").toList().last()
         assertTrue(declined.toolExecutions.isEmpty())
         assertTrue(declined.text.contains("won't"))
 
-        // Anything else drops the pending action and is handled as a new request
         gemmaEngine.pendingConfirmation = pending
-        val other = router.processUserTurn("Explain how rainbows form").toList().last()
+        val other = gemmaEngine.processUserTurn("Explain how rainbows form").toList().last()
         assertEquals(ModelTier.GEMMA_E2B_QAT_MTP, other.modelTier)
         assertEquals(null, gemmaEngine.pendingConfirmation)
     }
@@ -528,11 +481,11 @@ class DualModelRouterTest {
         assertEquals("Mom", parked?.request?.arguments?.get("target"))
         assertTrue(finished.last().awaitingConfirmation)
 
-        toolSet.changeDeviceSetting("flashlight", "on")
+        toolSet.changeDeviceSetting("flashlight", "on", "")
         assertEquals("change_device_setting", finished.last().toolName)
         assertEquals("flashlight on", finished.last().displayDetail)
 
-        toolSet.setTimer(300, "")
+        toolSet.setTimer(300, "", "")
         assertEquals("5 min", finished.last().displayDetail)
 
         val unknown = toolSet.assistantFeature("teleport", "")
@@ -540,13 +493,19 @@ class DualModelRouterTest {
     }
 
     @Test
-    fun `system prompt carries voice rules and tool guidance instead of per-turn injections`() {
-        val voice = gemmaEngine.buildSystemPromptText(voiceMode = true)
-        assertTrue(voice.contains("read aloud"))
-        assertTrue(voice.contains("web search"))
-        val text = gemmaEngine.buildSystemPromptText(voiceMode = false)
-        assertFalse(text.contains("read aloud"))
-        assertFalse(text.contains("["))
+    fun `system prompt carries voice rule, tool guidance, and no shortcut catalog dump`() {
+        val text = gemmaEngine.buildSystemPromptText(toolGroups = setOf(GemmaLiteRtEngine.APP_ACTIONS_GROUP))
+        gemmaEngine.isVoiceMode = true
+        val voice = gemmaEngine.buildSystemPromptText(toolGroups = setOf(GemmaLiteRtEngine.APP_ACTIONS_GROUP))
+        gemmaEngine.isVoiceMode = false
+        assertEquals("switching voice mode must not change the prompt (no conversation rebuild)", text, voice)
+        assertTrue(text.contains("${GemmaLiteRtEngine.VOICE_TAG} is spoken"))
+        assertTrue(text.contains("read aloud"))
+        assertTrue(text.contains("Web searches"))
+        assertTrue(text.contains("action tool's reply"))
+        assertTrue(text.contains("never open apps or trigger shortcuts"))
+        assertTrue(text.contains("call find_app_actions first"))
+        assertFalse(text.contains("App actions for run_app_action"))
     }
 
     @Test
@@ -577,5 +536,4 @@ class DualModelRouterTest {
         assertFalse(tts.isLikelySelfEcho("what is the weather in Paris"))
         assertFalse(tts.isEchoGuardActive())
     }
-
 }

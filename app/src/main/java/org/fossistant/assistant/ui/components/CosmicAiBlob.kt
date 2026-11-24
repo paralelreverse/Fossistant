@@ -93,6 +93,9 @@ fun CosmicAiBlob(
                 last = now
                 frameNanos = now
             }
+            if (physics.state == BlobActivityState.IDLE && !physics.showRings) {
+                kotlinx.coroutines.delay(16)
+            }
         }
     }
 

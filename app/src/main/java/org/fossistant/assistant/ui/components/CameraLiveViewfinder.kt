@@ -42,6 +42,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -54,8 +55,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.fossistant.assistant.model.BlobMoodTheme
 import java.io.ByteArrayOutputStream
 
@@ -73,6 +77,7 @@ fun CameraLiveViewfinder(
     heightDp: Int = 225
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var useFrontCamera by remember { mutableStateOf(false) }
     var framesStreamedCount by remember { mutableIntStateOf(0) }
     var cameraError by remember { mutableStateOf<String?>(null) }
@@ -96,7 +101,8 @@ fun CameraLiveViewfinder(
         while (isActive) {
             val tv = textureViewRef
             if (tv != null && tv.isAvailable) {
-                val jpeg = captureJpegFromTextureView(tv)
+                val bmp = captureBitmapOnMain(tv)
+                val jpeg = bmp?.let { compressBitmapJpeg(it) }
                 if (jpeg != null && jpeg.isNotEmpty()) {
                     onFrameCaptured(jpeg)
                     framesStreamedCount++
@@ -200,8 +206,11 @@ fun CameraLiveViewfinder(
                         .background(Color(0xCC1E293B))
                         .border(1.dp, moodTheme.secondaryAccent, CircleShape)
                         .clickable {
-                            textureViewRef?.let { tv ->
-                                captureJpegFromTextureView(tv)?.let { jpeg ->
+                            val tv = textureViewRef ?: return@clickable
+                            scope.launch {
+                                val bmp = captureBitmapOnMain(tv) ?: return@launch
+                                val jpeg = compressBitmapJpeg(bmp)
+                                if (jpeg != null && jpeg.isNotEmpty()) {
                                     onFrameCaptured(jpeg)
                                     framesStreamedCount++
                                 }
@@ -290,14 +299,21 @@ fun CameraLiveViewfinder(
  * size asked for, so it is requested at the camera's own shape (640x480 sensor output, upright in portrait =
  * 480x640) rather than the wide viewfinder box, which used to squash every frame Gemma saw.
  */
-private fun captureJpegFromTextureView(textureView: TextureView): ByteArray? {
-    return runCatching {
+private fun captureBitmapOnMain(textureView: TextureView): Bitmap? =
+    runCatching {
         val portrait = textureView.resources.configuration.orientation != android.content.res.Configuration.ORIENTATION_LANDSCAPE
-        val bmp: Bitmap = (if (portrait) textureView.getBitmap(480, 640) else textureView.getBitmap(640, 480)) ?: return null
-        val out = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, 82, out)
-        bmp.recycle()
-        out.toByteArray()
+        if (portrait) textureView.getBitmap(480, 640) else textureView.getBitmap(640, 480)
+    }.getOrNull()
+
+private suspend fun compressBitmapJpeg(bmp: Bitmap): ByteArray? = withContext(Dispatchers.Default) {
+    runCatching {
+        try {
+            val out = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 82, out)
+            out.toByteArray()
+        } finally {
+            bmp.recycle()
+        }
     }.getOrNull()
 }
 

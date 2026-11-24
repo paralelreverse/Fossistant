@@ -1,3 +1,5 @@
+import java.security.KeyStore
+import java.security.MessageDigest
 import java.util.Properties
 
 plugins {
@@ -8,7 +10,12 @@ plugins {
 }
 
 // Release signing key, kept outside the repo: keystore.properties (git-ignored) in the project root with
-// storeFile, storePassword, keyAlias, keyPassword. Without it, release builds are unsigned.
+// storeFile, storePassword, keyAlias, keyPassword. Without it, release builds are unsigned and debug builds use
+// the local debug key (fine for a fork, but such an APK can't update the published app).
+// With it, every build (debug too) is signed with the release key, so any APK installs over any other.
+/** SHA-256 of the certificate every published Fossistant APK is signed with (v1.0.0 onward). */
+val RELEASE_CERT_SHA256 = "40be3e29385a2cd5d4ed84ff91c151729b49d709ff1c9ca036c92addb102a227"
+
 val releaseSigning = Properties().apply {
     val file = rootProject.file("keystore.properties")
     if (file.exists()) file.inputStream().use { load(it) }
@@ -24,6 +31,19 @@ android {
                 storePassword = releaseSigning.getProperty("storePassword")
                 keyAlias = releaseSigning.getProperty("keyAlias")
                 keyPassword = releaseSigning.getProperty("keyPassword")
+            }
+            // Android only updates an app with an APK signed by the same key. Refuse to build with any key but
+            // the one the published releases use, so no build can lock a phone out of later updates.
+            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+            file(releaseSigning.getProperty("storeFile")).inputStream().use {
+                keyStore.load(it, releaseSigning.getProperty("storePassword").toCharArray())
+            }
+            val certificate = keyStore.getCertificate(releaseSigning.getProperty("keyAlias"))
+                ?: throw GradleException("keystore.properties: no key named '${releaseSigning.getProperty("keyAlias")}' in the keystore")
+            val digest = MessageDigest.getInstance("SHA-256").digest(certificate.encoded)
+                .joinToString("") { "%02x".format(it) }
+            if (digest != RELEASE_CERT_SHA256) {
+                throw GradleException("keystore.properties points to a key with certificate $digest, not the release key $RELEASE_CERT_SHA256")
             }
         }
     }
@@ -92,6 +112,8 @@ android {
             )
         }
         debug {
+            // A debug build signed with the debug key would block every later release update on that phone.
+            signingConfigs.findByName("release")?.let { signingConfig = it }
             isMinifyEnabled = false
         }
     }

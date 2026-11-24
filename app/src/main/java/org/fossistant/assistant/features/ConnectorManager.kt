@@ -16,10 +16,11 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.fossistant.assistant.model.ToolExecutionResult
+import org.fossistant.assistant.util.SecretCipher
+import org.fossistant.assistant.util.SharedHttp
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -33,7 +34,7 @@ class ConnectorManager(
     val store: JsonListStore<Connector>,
     private val onToolsChanged: (String) -> Unit
 ) {
-    private val http = OkHttpClient.Builder()
+    private val http = org.fossistant.assistant.util.SharedHttp.client.newBuilder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
@@ -47,13 +48,14 @@ class ConnectorManager(
 
     /** Connects to [connector], lists its tools and saves them. Returns the updated connector. */
     suspend fun refresh(connector: Connector): Connector = withContext(Dispatchers.IO) {
+        val securedInput = connector.copy(token = SecretCipher.encrypt(connector.token.trim()))
         val updated = try {
-            sessions.remove(connector.id)
+            sessions.remove(securedInput.id)
             val tools = mutableListOf<ConnectorTool>()
             var cursor: String? = null
             do {
                 val params = buildJsonObject { cursor?.let { put("cursor", it) } }
-                val result = call(connector, "tools/list", params)
+                val result = call(securedInput, "tools/list", params)
                 result["tools"]?.jsonArray?.forEach { element ->
                     val tool = element.jsonObject
                     val schema = tool["inputSchema"]?.jsonObject
@@ -68,9 +70,9 @@ class ConnectorManager(
                 }
                 cursor = result["nextCursor"]?.jsonPrimitive?.contentOrNull
             } while (cursor != null && tools.size < 200)
-            connector.copy(tools = tools, lastError = "")
+            securedInput.copy(tools = tools, lastError = "")
         } catch (t: Throwable) {
-            connector.copy(lastError = t.message ?: t::class.java.simpleName)
+            securedInput.copy(lastError = t.message ?: t::class.java.simpleName)
         }
         store.upsert(updated)
         publishToolSummary()
@@ -78,7 +80,7 @@ class ConnectorManager(
     }
 
     fun save(connector: Connector) {
-        store.upsert(connector)
+        store.upsert(connector.copy(token = SecretCipher.encrypt(connector.token.trim())))
         publishToolSummary()
     }
 
@@ -116,7 +118,7 @@ class ConnectorManager(
     }
 
     /** Lists the enabled tools for the system prompt, compactly ("name(a, b): description"). */
-    private fun publishToolSummary() {
+    internal fun publishToolSummary() {
         val summary = store.items.value.filter { it.enabled }
             .flatMap { it.tools }
             .take(MAX_TOOLS_IN_PROMPT)
@@ -182,12 +184,20 @@ class ConnectorManager(
 
     /** POSTs one JSON-RPC message; reads a JSON or SSE reply and returns the message with [expectId]. */
     private fun post(connector: Connector, body: JsonObject, sessionId: String?, expectId: Int?): Pair<JsonObject?, String?> {
+        val targetUrl = connector.url.trim()
+        val plaintextToken = SecretCipher.decrypt(connector.token.trim())
+        if (plaintextToken.isNotBlank() &&
+            !targetUrl.startsWith("https://", ignoreCase = true) &&
+            !SharedHttp.isPrivateOrLanUrl(targetUrl)
+        ) {
+            error("Refusing to send access token over unencrypted HTTP to a public host. Use HTTPS.")
+        }
         val builder = Request.Builder()
-            .url(connector.url.trim())
+            .url(targetUrl)
             .header("Accept", "application/json, text/event-stream")
             .header("MCP-Protocol-Version", PROTOCOL_VERSION)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
-        if (connector.token.isNotBlank()) builder.header("Authorization", "Bearer ${connector.token.trim()}")
+        if (plaintextToken.isNotBlank()) builder.header("Authorization", "Bearer $plaintextToken")
         if (sessionId != null) builder.header("Mcp-Session-Id", sessionId)
         http.newCall(builder.build()).execute().use { response ->
             if (response.code == 404 && sessionId != null) throw SessionExpired()
@@ -201,10 +211,17 @@ class ConnectorManager(
             if (contentType.contains("text/event-stream")) {
                 val reader = source.charStream().buffered()
                 val data = StringBuilder()
-                while (true) {
+                var totalSseChars = 0
+                while (totalSseChars < MAX_HTTP_RESPONSE_BYTES) {
                     val line = reader.readLine() ?: break
+                    totalSseChars += line.length + 1
                     when {
-                        line.startsWith("data:") -> data.append(line.removePrefix("data:").trim())
+                        line.startsWith("data:") -> {
+                            val chunk = line.removePrefix("data:").trim()
+                            if (data.length + chunk.length <= MAX_HTTP_RESPONSE_BYTES) {
+                                data.append(chunk)
+                            }
+                        }
                         line.isEmpty() && data.isNotEmpty() -> {
                             val message = parseMessage(data.toString())
                             data.clear()
@@ -215,7 +232,7 @@ class ConnectorManager(
                 if (data.isNotEmpty()) parseMessage(data.toString())?.takeIf { it.idMatches(expectId) }?.let { return it to newSession }
                 return null to newSession
             }
-            val text = source.string()
+            val text = SharedHttp.readCappedText(source, MAX_HTTP_RESPONSE_BYTES)
             val parsed = runCatching { json.parseToJsonElement(text) }.getOrNull()
             val message = when (parsed) {
                 is JsonObject -> parsed
@@ -239,5 +256,6 @@ class ConnectorManager(
         const val PROTOCOL_VERSION = "2025-06-18"
         // Each listed tool costs prompt tokens on every turn.
         const val MAX_TOOLS_IN_PROMPT = 15
+        const val MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
     }
 }

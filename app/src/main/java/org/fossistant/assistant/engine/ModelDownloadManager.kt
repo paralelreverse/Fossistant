@@ -8,21 +8,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.fossistant.assistant.model.PrimaryLlmModel
 import org.fossistant.assistant.model.WhisperModelChoice
 import org.fossistant.assistant.util.AppLogger
+import org.fossistant.assistant.util.ResumableFileDownloader
 import java.io.File
-import java.io.FileOutputStream
-import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
-import kotlin.coroutines.coroutineContext
 
 /**
  * Downloads the models an APK doesn't carry (slim) straight into `files/models`, the folder the engines already
@@ -60,7 +55,7 @@ class ModelDownloadManager(private val context: Context) {
 
     private val modelsDir = File(context.filesDir, "models").apply { mkdirs() }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val http = OkHttpClient.Builder()
+    private val http = org.fossistant.assistant.util.SharedHttp.client.newBuilder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
@@ -159,46 +154,14 @@ class ModelDownloadManager(private val context: Context) {
     }
 
     private suspend fun download(item: Item, onBytes: (Long, Long) -> Unit) {
-        val part = File(modelsDir, item.fileName + ".part")
-        if (item.sizeBytes > 0 && part.length() > item.sizeBytes) part.delete()
-        if (item.sizeBytes > 0 && part.length() == item.sizeBytes) return
-        val request = Request.Builder().url(item.url).apply {
-            if (part.length() > 0) header("Range", "bytes=${part.length()}-")
-        }.build()
-        http.newCall(request).execute().use { response ->
-            if (response.code == 416 && part.length() == item.sizeBytes) return
-            if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code} while downloading ${item.label}")
-            val append = response.code == 206
-            var written = if (append) part.length() else 0L
-            val body = response.body ?: throw IllegalStateException("Empty response for ${item.label}")
-            var windowStart = System.nanoTime()
-            var windowBytes = 0L
-            var speed = 0L
-            FileOutputStream(part, append).use { out ->
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(512 * 1024)
-                    var lastReport = 0L
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        out.write(buffer, 0, read)
-                        written += read
-                        windowBytes += read
-                        val elapsed = System.nanoTime() - windowStart
-                        if (elapsed > 1_000_000_000L) {
-                            speed = windowBytes * 1_000_000_000L / elapsed
-                            windowStart = System.nanoTime()
-                            windowBytes = 0L
-                        }
-                        if (written - lastReport > 2L * 1024 * 1024) {
-                            lastReport = written
-                            onBytes(written, speed)
-                        }
-                    }
-                }
-            }
-        }
+        ResumableFileDownloader.downloadToPart(
+            http = http,
+            url = item.url,
+            target = File(modelsDir, item.fileName),
+            expectedSizeBytes = item.sizeBytes,
+            label = item.label,
+            onProgress = onBytes
+        )
     }
 
     private fun verifyAndInstall(item: Item) {
@@ -206,7 +169,7 @@ class ModelDownloadManager(private val context: Context) {
         if (item.sizeBytes > 0 && part.length() != item.sizeBytes) {
             throw IllegalStateException("${item.label} is incomplete (${part.length()} of ${item.sizeBytes} bytes); try again.")
         }
-        if (item.sha256.isNotBlank() && !sha256(part).equals(item.sha256, ignoreCase = true)) {
+        if (item.sha256.isNotBlank() && !ResumableFileDownloader.sha256(part).equals(item.sha256, ignoreCase = true)) {
             part.delete()
             throw IllegalStateException(
                 "${item.label} doesn't match the expected build" +
@@ -218,11 +181,10 @@ class ModelDownloadManager(private val context: Context) {
             throw IllegalStateException("The downloaded ${item.label} has no MTP drafter, so it was rejected.")
         }
         val target = File(modelsDir, item.fileName)
-        if (target.exists()) target.delete()
         // Drop GPU programs built for an older file of the same name.
         File(context.filesDir, "litertlm_compiled_shaders").listFiles { f -> f.name.startsWith("${item.fileName}_") }
             ?.forEach { it.delete() }
-        if (!part.renameTo(target)) throw IllegalStateException("Couldn't save ${item.label}.")
+        ResumableFileDownloader.installPartFile(part, target, item.label)
         AppLogger.i(TAG, "Installed ${item.label} (${target.length()} bytes) in ${target.parent}")
     }
 
@@ -234,19 +196,6 @@ class ModelDownloadManager(private val context: Context) {
         // The pinned SHA-256 already identifies the MTP build; only an unreadable file without a hash fails here.
         AppLogger.w(TAG, "Couldn't read ${file.name}'s capabilities: ${it.message}")
         true
-    }
-
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(4 * 1024 * 1024)
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     companion object {

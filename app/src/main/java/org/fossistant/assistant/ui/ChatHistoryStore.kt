@@ -9,13 +9,17 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Saved chats, persisted to `filesDir/chats/chats.json` so they survive app restarts. One instance lives in
  * [org.fossistant.assistant.FossistantApp] and is shared by the main screen and the assistant popup, which
  * have separate view models.
  */
-class ChatHistoryStore(storageDir: File?) {
+class ChatHistoryStore(
+    storageDir: File?,
+    eagerLoad: Boolean = true
+) {
 
     private val file: File? = storageDir?.let { File(it, "chats").apply { mkdirs() }.resolve("chats.json") }
     private val backupFile: File? = file?.let { File(it.parentFile, "chats.json.bak") }
@@ -25,9 +29,38 @@ class ChatHistoryStore(storageDir: File?) {
     private val writer = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "ChatHistoryWriter").apply { isDaemon = true }
     }
+    private val diskLoaded = AtomicBoolean(false)
+    private val deletedIdsBeforeLoad = java.util.Collections.synchronizedSet(HashSet<String>())
+    @Volatile
+    private var clearedBeforeLoad = false
+    @Volatile
+    private var lastChatWrittenBeforeLoad = false
 
-    private val _sessions = MutableStateFlow(load())
+    private val _sessions = MutableStateFlow(emptyList<PreviousChatSession>())
     val sessions: StateFlow<List<PreviousChatSession>> = _sessions.asStateFlow()
+
+    @Volatile
+    private var cachedLastChat: Pair<String, Long>? = null
+
+    init {
+        if (eagerLoad) loadIfNeeded()
+    }
+
+    /** Loads persisted chats and last-chat pointer once (safe to call from `Dispatchers.IO`). */
+    fun loadIfNeeded() {
+        if (!diskLoaded.compareAndSet(false, true)) return
+        if (!lastChatWrittenBeforeLoad && cachedLastChat == null) {
+            cachedLastChat = readLastChat()
+        }
+        if (clearedBeforeLoad) return
+        val fromDisk = load()
+        if (fromDisk.isEmpty()) return
+        _sessions.update { current ->
+            val currentIds = current.mapTo(HashSet()) { it.id }
+            val filteredDisk = fromDisk.filter { it.id !in deletedIdsBeforeLoad && it.id !in currentIds }
+            (current + filteredDisk).take(MAX_CHATS)
+        }
+    }
 
     /** Inserts or replaces a chat and moves it to the top of the list. */
     fun upsert(session: PreviousChatSession) {
@@ -40,6 +73,7 @@ class ChatHistoryStore(storageDir: File?) {
                 )
             }
         )
+        deletedIdsBeforeLoad.remove(cleaned.id)
         _sessions.update { current ->
             (listOf(cleaned) + current.filterNot { it.id == session.id }).take(MAX_CHATS)
         }
@@ -51,15 +85,29 @@ class ChatHistoryStore(storageDir: File?) {
      * comes back within a few minutes; see [org.fossistant.assistant.ui.AssistantViewModel.restoreLastChat].
      */
     var lastOpenedChatId: String?
-        get() = readLastChat()?.first
+        get() {
+            if (!diskLoaded.get() && !lastChatWrittenBeforeLoad && cachedLastChat == null) {
+                cachedLastChat = readLastChat()
+            }
+            return cachedLastChat?.first
+        }
         set(value) {
+            lastChatWrittenBeforeLoad = true
+            val now = System.currentTimeMillis()
+            cachedLastChat = value?.let { it to now }
             val target = lastChatFile ?: return
-            val line = value?.let { "$it|${System.currentTimeMillis()}" }
+            val line = value?.let { "$it|$now" }
             writer.execute { runCatching { if (line == null) target.delete() else target.writeText(line) } }
         }
 
     /** When the last chat was last used (0 if unknown). */
-    val lastChatUsedAtMs: Long get() = readLastChat()?.second ?: 0L
+    val lastChatUsedAtMs: Long
+        get() {
+            if (!diskLoaded.get() && !lastChatWrittenBeforeLoad && cachedLastChat == null) {
+                cachedLastChat = readLastChat()
+            }
+            return cachedLastChat?.second ?: 0L
+        }
 
     /** Marks the last chat as used just now (e.g. when the app goes to the background). */
     fun touchLastChat() {
@@ -75,11 +123,14 @@ class ChatHistoryStore(storageDir: File?) {
     }
 
     fun delete(sessionId: String) {
+        if (!diskLoaded.get()) deletedIdsBeforeLoad.add(sessionId)
         _sessions.update { current -> current.filterNot { it.id == sessionId } }
         persist()
     }
 
     fun clear() {
+        if (!diskLoaded.get()) clearedBeforeLoad = true
+        deletedIdsBeforeLoad.clear()
         _sessions.value = emptyList()
         persist()
     }

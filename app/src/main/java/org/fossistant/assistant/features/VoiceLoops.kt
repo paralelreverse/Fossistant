@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.fossistant.assistant.FossistantApp
 import org.fossistant.assistant.R
@@ -42,6 +43,7 @@ internal suspend fun listenOnce(scope: CoroutineScope, language: SupportedLangua
         language = language,
         continuous = false,
         onError = { if (!result.isCompleted) result.complete("") },
+        transcriptNeeded = true,
         onFinalResult = { text -> if (!result.isCompleted) result.complete(text) }
     )
     return try {
@@ -187,8 +189,13 @@ class LiveScreenShareService : Service() {
             accessibility.updateBlobState(BlobActivityState.AI_REASONING)
             val screenshot = accessibility.captureScreenshotJpeg()
             val attachments = screenshot?.let { bytes ->
-                val file = File(cacheDir, "screen_share_${System.currentTimeMillis()}.jpg").apply { writeBytes(bytes) }
-                cacheDir.listFiles { f -> f.name.startsWith("screen_share_") && f != file }?.forEach { it.delete() }
+                val file = withContext(Dispatchers.IO) {
+                    val saved = File(cacheDir, "screen_share_${System.currentTimeMillis()}.jpg").apply { writeBytes(bytes) }
+                    runCatching {
+                        cacheDir.listFiles { f -> f.name.startsWith("screen_share_") && f != saved }?.forEach { it.delete() }
+                    }
+                    saved
+                }
                 listOf(
                     MediaAttachment(
                         id = "screen_share",
@@ -201,14 +208,19 @@ class LiveScreenShareService : Service() {
                 )
             }.orEmpty()
             var answer = ""
-            app.router.processUserTurn(question, attachments).collect { message ->
-                if (!message.isReasoningPhase) answer = message.text
-            }
-            if (answer.isNotBlank()) {
+            var spoken = false
+            fun speak() {
+                spoken = true
                 accessibility.updateBlobState(BlobActivityState.AI_TALKING)
                 app.ttsEngine.speakFast(answer, flushQueue = true)
-                awaitSpeechDone()
             }
+            app.gemmaEngine.processUserTurn(question, attachments).collect { message ->
+                if (!message.isReasoningPhase) answer = message.text
+                // Final answer (an action's own reply comes before Gemma's hidden second pass ends): speak it now.
+                if (!spoken && !message.isStreaming && answer.isNotBlank()) speak()
+            }
+            if (!spoken && answer.isNotBlank()) speak()
+            if (spoken) awaitSpeechDone()
         }
     }
 
@@ -247,7 +259,9 @@ class LiveScreenShareService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(Intent(context, LiveScreenShareService::class.java).setAction(ACTION_STOP))
+            runCatching {
+                context.startService(Intent(context, LiveScreenShareService::class.java).setAction(ACTION_STOP))
+            }
         }
     }
 }

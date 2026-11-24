@@ -1,5 +1,12 @@
 package org.fossistant.assistant.engine
 
+import com.google.ai.edge.litertlm.Tool
+import kotlin.reflect.KFunction
+import kotlin.reflect.full.declaredMemberFunctions
+import kotlin.reflect.full.findAnnotation
+import kotlin.reflect.full.instanceParameter
+import kotlin.reflect.full.valueParameters
+
 /**
  * Rescues tool calls LiteRT-LM refuses to parse. Gemma 4 writes calls as
  * `call:name{key:<|"|>text<|"|>,count:5}`, but the small model sometimes drops the string delimiters
@@ -93,5 +100,50 @@ object GemmaToolCallRecovery {
             if (key.isNotEmpty()) args[key] = value.trim()
         }
         return args
+    }
+}
+
+/**
+ * Invokes `@Tool` methods of [FossistantGemmaToolSet] (every group of it) by snake_case name when
+ * LiteRT fails to parse a `call:name{...}` block emitted by Gemma.
+ */
+class ToolSetInvoker(toolSet: FossistantGemmaToolSet) {
+    private data class Entry(val owner: Any, val function: KFunction<*>)
+
+    private val toolSets = toolSet.allToolSets
+
+    private val byName: Map<String, Entry> by lazy {
+        val map = linkedMapOf<String, Entry>()
+        for (owner in toolSets) {
+            for (fn in owner::class.declaredMemberFunctions) {
+                fn.findAnnotation<Tool>() ?: continue
+                val snake = fn.name.replace(Regex("([a-z0-9])([A-Z])"), "$1_$2").lowercase()
+                map[snake] = Entry(owner, fn)
+            }
+        }
+        map
+    }
+
+    fun invoke(name: String, arguments: Map<String, String>): String {
+        val entry = byName[name] ?: return "Error: unknown tool '$name'."
+        val fn = entry.function
+        return try {
+            val args = mutableMapOf<kotlin.reflect.KParameter, Any?>()
+            fn.instanceParameter?.let { args[it] = entry.owner }
+            fn.valueParameters.forEach { param ->
+                val raw = arguments[param.name].orEmpty().trim()
+                args[param] = when (param.type.classifier) {
+                    Int::class -> raw.toDoubleOrNull()?.toInt() ?: 0
+                    Long::class -> raw.toDoubleOrNull()?.toLong() ?: 0L
+                    Double::class -> raw.toDoubleOrNull() ?: 0.0
+                    Boolean::class -> raw.lowercase() in setOf("true", "on", "yes", "1")
+                    else -> raw
+                }
+            }
+            fn.callBy(args)?.toString().orEmpty()
+        } catch (t: Throwable) {
+            val cause = t.cause ?: t
+            "Error running $name: ${cause.message ?: cause::class.simpleName}"
+        }
     }
 }

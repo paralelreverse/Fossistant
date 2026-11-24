@@ -115,7 +115,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -231,12 +234,12 @@ class MainActivity : ComponentActivity() {
                 ) { uri -> uri?.let { viewModel.attachMediaUri(it, MediaModality.IMAGE) } }
 
                 // Plus menu: a photo taken with the camera app, and any document (text, PDF, Word)
-                var pendingPhotoUri by remember { mutableStateOf<android.net.Uri?>(null) }
+                var pendingPhotoUriString by rememberSaveable { mutableStateOf<String?>(null) }
                 val takePhotoLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.TakePicture()
                 ) { saved ->
-                    val uri = pendingPhotoUri
-                    pendingPhotoUri = null
+                    val uri = pendingPhotoUriString?.let { android.net.Uri.parse(it) }
+                    pendingPhotoUriString = null
                     if (saved && uri != null) viewModel.attachMediaUri(uri, MediaModality.IMAGE)
                 }
                 fun launchCamera() {
@@ -244,7 +247,7 @@ class MainActivity : ComponentActivity() {
                     dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(20)?.forEach { it.delete() }
                     val file = java.io.File(dir, "photo_${System.currentTimeMillis()}.jpg")
                     val uri = androidx.core.content.FileProvider.getUriForFile(this@MainActivity, "$packageName.files", file)
-                    pendingPhotoUri = uri
+                    pendingPhotoUriString = uri.toString()
                     takePhotoLauncher.launch(uri)
                 }
                 val photoPermissionLauncher = rememberLauncherForActivityResult(
@@ -367,48 +370,20 @@ class MainActivity : ComponentActivity() {
                     ActivityResultContracts.RequestMultiplePermissions()
                 ) { /* Permissions evaluated dynamically by DeviceAndWebToolExecutor */ }
 
-                LaunchedEffect(
-                    uiState.screenMode,
-                    uiState.isListeningVoice,
-                    uiState.isVoiceMutedByUser,
-                    uiState.isGenerating,
-                    uiState.isTtsSpeaking,
-                    uiState.isReasoning,
-                    isScreenResumed
-                ) {
-                    if (isScreenResumed &&
-                        uiState.screenMode == AppScreenMode.VOICE_MODE &&
-                        !uiState.isListeningVoice &&
-                        !uiState.isVoiceMutedByUser &&
-                        !uiState.isGenerating &&
-                        !uiState.isTtsSpeaking &&
-                        !uiState.isReasoning
-                    ) {
-                        if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) ==
-                            PackageManager.PERMISSION_GRANTED
-                        ) {
-                            startDictation(uiState.selectedLanguage, continuous = FossistantApp.isVoiceDuplexMode)
-                        }
+                org.fossistant.assistant.ui.components.VoiceTurnTakingEffects(
+                    context = this@MainActivity,
+                    viewModel = viewModel,
+                    uiState = uiState,
+                    isActiveSurface = isScreenResumed && uiState.screenMode == AppScreenMode.VOICE_MODE,
+                    watchdogIntervalMs = VOICE_MIC_CHECK_MS,
+                    logTag = "MainActivity",
+                    onStartListening = {
+                        startDictation(
+                            language = viewModel.uiState.value.selectedLanguage,
+                            continuous = FossistantApp.isVoiceDuplexMode
+                        )
                     }
-                }
-
-                // Safety net for the effect above: if voice mode sits idle with the microphone off (an engine stop
-                // the state change didn't catch), start listening again.
-                LaunchedEffect(uiState.screenMode, isScreenResumed) {
-                    while (uiState.screenMode == AppScreenMode.VOICE_MODE && isScreenResumed) {
-                        kotlinx.coroutines.delay(VOICE_MIC_CHECK_MS)
-                        val s = viewModel.uiState.value
-                        val idle = s.screenMode == AppScreenMode.VOICE_MODE && !s.isVoiceMutedByUser &&
-                            !s.isGenerating && !s.isTtsSpeaking && !s.isReasoning
-                        if (idle && !viewModel.sttEngine.isListening.value &&
-                            ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) ==
-                            PackageManager.PERMISSION_GRANTED
-                        ) {
-                            org.fossistant.assistant.util.AppLogger.w("MainActivity", "Voice mode was idle with the microphone off: listening again")
-                            startDictation(s.selectedLanguage, continuous = FossistantApp.isVoiceDuplexMode)
-                        }
-                    }
-                }
+                )
 
                 BiomorphicFossistantApp(
                     uiState = uiState,
@@ -489,7 +464,8 @@ class MainActivity : ComponentActivity() {
                         onClearAllChats = { viewModel.clearAllChatSessions() },
                         onStartProjectChat = { viewModel.startProjectChat(it) },
                         onToggleMtp = { viewModel.setMtpEnabled(it) },
-                        onToggleStrictToolCalls = { viewModel.setStrictToolCalls(it) }
+                        onToggleStrictToolCalls = { viewModel.setStrictToolCalls(it) },
+                        onToggleGemmaVoice = { viewModel.setGemmaVoiceInput(it) }
                     ),
                     onBackFromSettings = {
                         viewModel.setScreenMode(
@@ -753,27 +729,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startDictation(language: SupportedLanguage, continuous: Boolean = FossistantApp.isVoiceDuplexMode) {
-        viewModel.setVoiceListeningState(true, "Listening with Whisper (${language.displayName})...")
-        viewModel.sttEngine.startListening(
+        viewModel.startVoiceCapture(
             scope = lifecycleScope,
             language = language,
             continuous = continuous,
-            onPartial = { partial ->
-                viewModel.setVoiceListeningState(true, partial)
-            },
-            onError = { error ->
-                org.fossistant.assistant.util.AppLogger.w("MainActivity", "Listening stopped: $error")
-            },
-            onFinalResult = { transcript ->
-                if (transcript.isNotBlank()) {
-                    if (!continuous) {
-                        viewModel.sttEngine.stopListening()
-                    }
-                    viewModel.sendPrompt(transcript, stayInVoiceMode = true, forceSpeakResponse = true)
-                } else if (!continuous) {
-                    viewModel.setVoiceListeningState(false)
-                }
-            }
+            enterVoiceScreenMode = true
         )
     }
 
@@ -966,7 +926,6 @@ private fun ModelPreparingBanner(modelName: String, status: String, moodTheme: B
     )
     val detail = when {
         status.contains("Unpacking", ignoreCase = true) -> status.trimEnd('.')
-        status.contains("llama", ignoreCase = true) -> "Loading the model and checking the GPU"
         else -> "Loading onto the GPU"
     }
     Column(
@@ -1036,6 +995,7 @@ data class FeatureUiActions(
     val onStartProjectChat: (String) -> Unit = {},
     val onToggleMtp: (Boolean) -> Unit = {},
     val onToggleStrictToolCalls: (Boolean) -> Unit = {},
+    val onToggleGemmaVoice: (Boolean) -> Unit = {},
     val onPickImageModel: (org.fossistant.assistant.model.ImageGenModelChoice) -> Unit = {},
     val onCancelImageDownload: (org.fossistant.assistant.model.ImageGenModelChoice) -> Unit = {},
     val onDisarmImageGen: () -> Unit = {}
@@ -2511,7 +2471,7 @@ private fun FrostedSideMenuDrawer(
 
 /**
  * Glassmorphic Settings Screen with dedicated submenus for:
- * 1. Voice Profiles (7 Languages, 21 Fast TTS Voices)
+ * 1. Voice Profiles (26 Languages, 78 Fast TTS Voices)
  * 2. Voice Trigger / Wake Word Submenu (Custom phrase, sensitivity slider, live mic test meter)
  * 3. Personality & AI Name Submenu (Custom AI Name that changes app title, Persona, Custom instructions, Response length)
  * 4. Customization (Blob Color & App Mood + Dynamic Launcher Icon styles)
@@ -2604,7 +2564,7 @@ private fun BiomorphicSettingsScreen(
             )
         }
 
-        // 1. Voice Profiles (7 Languages, 21 Fast TTS Voices - Tap row to choose voice, switch to toggle)
+        // 1. Voice Profiles (26 Languages, 78 Fast TTS Voices - Tap row to choose voice, switch to toggle)
         SettingsGlassRowToggle(
             title = "Voice Profiles (${uiState.selectedVoiceProfile.name})",
             checked = uiState.voiceProfilesEnabled,
@@ -2652,6 +2612,14 @@ private fun BiomorphicSettingsScreen(
             checked = uiState.strictToolCalls,
             moodTheme = moodTheme,
             onCheckedChange = featureActions.onToggleStrictToolCalls
+        )
+
+        // 2f. Experimental: Gemma hears voice prompts itself (no Whisper, no transcript)
+        SettingsGlassRowToggle(
+            title = if (uiState.gemmaVoiceInput) "Gemma Voice Input (Experimental): On" else "Gemma Voice Input (Experimental): Off",
+            checked = uiState.gemmaVoiceInput,
+            moodTheme = moodTheme,
+            onCheckedChange = featureActions.onToggleGemmaVoice
         )
 
         // 3. Personality & AI Name Submenu (Change AI Name, App Title, Character Persona & Custom Instructions)
@@ -3978,9 +3946,17 @@ private fun SystemLogsDialog(
     onDismiss: () -> Unit
 ) {
     val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
+    val scope = rememberCoroutineScope()
     var copiedFeedback by remember { mutableStateOf(false) }
-    var logText by remember { mutableStateOf(org.fossistant.assistant.util.AppLogger.getAllLogsAsText()) }
-    var lineCount by remember { mutableIntStateOf(org.fossistant.assistant.util.AppLogger.getLineCount()) }
+    var refreshTick by remember { mutableIntStateOf(0) }
+    val logLines by produceState<List<String>>(initialValue = emptyList(), refreshTick) {
+        value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            org.fossistant.assistant.util.AppLogger.getRecentLogs(1000)
+        }
+    }
+    val lineCount = remember(logLines, refreshTick) {
+        org.fossistant.assistant.util.AppLogger.getLineCount()
+    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -4006,9 +3982,15 @@ private fun SystemLogsDialog(
                 }
                 TextButton(
                     onClick = {
-                        val allLogs = org.fossistant.assistant.util.AppLogger.getAllLogsAsText()
-                        clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(allLogs))
-                        copiedFeedback = true
+                        scope.launch {
+                            // Binder transactions fail over ~1 MB; copy the newest ~180k chars cleanly.
+                            val boundedLogs = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                val allLogs = org.fossistant.assistant.util.AppLogger.getAllLogsAsText()
+                                if (allLogs.length > 180_000) "...(truncated oldest)...\n" + allLogs.takeLast(180_000) else allLogs
+                            }
+                            clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(boundedLogs))
+                            copiedFeedback = true
+                        }
                     }
                 ) {
                     Text(
@@ -4033,27 +4015,44 @@ private fun SystemLogsDialog(
                     shape = RoundedCornerShape(12.dp),
                     color = Color(0xFF080C14)
                 ) {
-                    val scrollState = rememberScrollState()
-                    LaunchedEffect(logText) {
-                        scrollState.scrollTo(scrollState.maxValue)
+                    val listState = rememberLazyListState()
+                    LaunchedEffect(logLines.size) {
+                        if (logLines.isNotEmpty()) {
+                            listState.scrollToItem(logLines.lastIndex)
+                        }
                     }
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(10.dp)
-                            .verticalScroll(scrollState)
-                    ) {
-                        BasicTextField(
-                            value = logText.ifBlank { "No logs recorded yet." },
-                            onValueChange = {},
-                            readOnly = true,
-                            textStyle = TextStyle(
-                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
-                                fontSize = 10.5.sp,
-                                lineHeight = 14.sp,
-                                color = Color(0xFFCBD5E1)
+                    if (logLines.isEmpty()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(12.dp),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            Text(
+                                text = if (lineCount == 0) "No logs recorded yet." else "Loading logs...",
+                                color = Color(0xFF94A3B8),
+                                fontSize = 11.sp
                             )
-                        )
+                        }
+                    } else {
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(10.dp)
+                        ) {
+                            items(logLines) { line ->
+                                Text(
+                                    text = line,
+                                    style = TextStyle(
+                                        fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace,
+                                        fontSize = 10.5.sp,
+                                        lineHeight = 14.sp,
+                                        color = Color(0xFFCBD5E1)
+                                    )
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -4066,8 +4065,7 @@ private fun SystemLogsDialog(
                 TextButton(
                     onClick = {
                         org.fossistant.assistant.util.AppLogger.clear()
-                        logText = org.fossistant.assistant.util.AppLogger.getAllLogsAsText()
-                        lineCount = org.fossistant.assistant.util.AppLogger.getLineCount()
+                        refreshTick++
                     }
                 ) {
                     Text("Clear Logs", color = Color(0xFFEF4444), fontSize = 13.sp)

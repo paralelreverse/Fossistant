@@ -3,7 +3,6 @@ package org.fossistant.assistant.tools
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.fossistant.assistant.model.ToolExecutionResult
@@ -20,10 +19,15 @@ class HomeAssistantClient(
     private val baseUrlProvider: () -> String,
     private val tokenProvider: () -> String
 ) {
-    private val http = OkHttpClient.Builder()
+    private val http = org.fossistant.assistant.util.SharedHttp.client.newBuilder()
         .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS)
+        .followRedirects(false)
         .build()
+
+    @Volatile private var cachedEntities: List<Entity>? = null
+    @Volatile private var cachedEntitiesAtMs: Long = 0L
+    @Volatile private var cachedEntitiesBaseUrl: String = ""
 
     private val baseUrl: String get() = baseUrlProvider().trim().trimEnd('/')
     private val token: String get() = tokenProvider().trim()
@@ -59,7 +63,7 @@ class HomeAssistantClient(
         val verb = normalizeAction(action)
             ?: return@withContext fail("Unknown smart home action '$action'. Use on, off, toggle, status, brightness, temperature, open, close, lock, unlock or activate.")
         val entities = try {
-            fetchEntities()
+            fetchEntities(forceRefresh = verb == "status")
         } catch (e: Exception) {
             return@withContext fail("Couldn't reach Home Assistant at $baseUrl: ${e.message}")
         }
@@ -79,6 +83,7 @@ class HomeAssistantClient(
                 .toRequestBody("application/json".toMediaType())
             http.newCall(request("/api/services/${entity.domain}/$service").post(body).build()).execute().use { response ->
                 if (response.isSuccessful) {
+                    cachedEntities = null
                     ToolExecutionResult("home_assistant", true, doneMessage(verb, entity, value))
                 } else {
                     fail("Home Assistant refused ${entity.domain}.$service for ${entity.name} (HTTP ${response.code}).")
@@ -89,17 +94,27 @@ class HomeAssistantClient(
         }
     }
 
-    private fun fetchEntities(): List<Entity> {
+    private fun fetchEntities(forceRefresh: Boolean = false): List<Entity> {
+        val currentBaseUrl = baseUrl
+        val now = System.currentTimeMillis()
+        val cached = cachedEntities
+        if (!forceRefresh && cached != null && cachedEntitiesBaseUrl == currentBaseUrl && now - cachedEntitiesAtMs < 20_000L) {
+            return cached
+        }
         http.newCall(request("/api/states").get().build()).execute().use { response ->
             if (response.code == 401) throw IllegalStateException("the access token was rejected")
             if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code}")
-            val array = JSONArray(response.body?.string().orEmpty())
-            return (0 until array.length()).map { i ->
+            val array = JSONArray(org.fossistant.assistant.util.SharedHttp.readCappedText(response.body, 2 * 1024 * 1024))
+            val fresh = (0 until array.length()).map { i ->
                 val obj = array.getJSONObject(i)
                 val attributes = obj.optJSONObject("attributes") ?: JSONObject()
                 val id = obj.getString("entity_id")
                 Entity(id, attributes.optString("friendly_name", id), obj.optString("state"), attributes)
             }
+            cachedEntities = fresh
+            cachedEntitiesBaseUrl = currentBaseUrl
+            cachedEntitiesAtMs = System.currentTimeMillis()
+            return fresh
         }
     }
 

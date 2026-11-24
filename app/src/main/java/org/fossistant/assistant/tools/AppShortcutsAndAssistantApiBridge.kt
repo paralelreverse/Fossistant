@@ -18,7 +18,11 @@ import android.provider.CalendarContract
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.provider.Settings
+import org.fossistant.assistant.util.AppLogger
+import org.json.JSONArray
+import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
+import java.io.File
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
@@ -91,12 +95,7 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
         }
 
         data class FamilyBellAnnouncement(val timeSpec: String, val message: String)
-        private val scheduledFamilyBells = CopyOnWriteArrayList<FamilyBellAnnouncement>(
-            listOf(
-                FamilyBellAnnouncement("07:30", "Good morning! Time for breakfast and school prep."),
-                FamilyBellAnnouncement("18:30", "Family dinner time!")
-            )
-        )
+        private val scheduledFamilyBells = CopyOnWriteArrayList<FamilyBellAnnouncement>()
 
         @Volatile
         private var stopwatchRunning = false
@@ -105,6 +104,94 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
         @Volatile
         private var stopwatchAccumulatedMs = 0L
         private val stopwatchLapsMs = CopyOnWriteArrayList<Long>()
+
+        @Volatile
+        private var cookbookLoadedFromDisk = false
+
+        private val WORD_SPLIT_REGEX = Regex("\\s+")
+        private val RELATIVE_DURATION_REGEX = Regex(
+            "(?i)(?:(\\bin\\b|\\+|push(?:ed)?(?:\\s+back)?|delay(?:ed)?(?:\\s+by)?|move(?:d)?(?:\\s+back)?|later(?:\\s+by)?|earlier(?:\\s+by)?|by|-)\\s*)?(\\d+(?:\\.\\d+)?)\\s*(hours?|hrs?|h|minutes?|mins?|m)\\b(?:\\s*(later|ahead|back|earlier))?"
+        )
+        private val WEEKDAYS = mapOf(
+            "sunday" to java.util.Calendar.SUNDAY,
+            "monday" to java.util.Calendar.MONDAY,
+            "tuesday" to java.util.Calendar.TUESDAY,
+            "wednesday" to java.util.Calendar.WEDNESDAY,
+            "thursday" to java.util.Calendar.THURSDAY,
+            "friday" to java.util.Calendar.FRIDAY,
+            "saturday" to java.util.Calendar.SATURDAY
+        )
+
+        internal fun parseRescheduleTargetMs(
+            oldStartMs: Long,
+            newTimeDescription: String,
+            shiftMinutes: Int,
+            nowMs: Long = System.currentTimeMillis()
+        ): Long {
+            val desc = newTimeDescription.trim()
+            if (desc.isNotEmpty()) {
+                val lower = desc.lowercase(java.util.Locale.ENGLISH)
+                RELATIVE_DURATION_REGEX.find(lower)?.let { m ->
+                    val prefix = m.groupValues[1].trim()
+                    val amount = m.groupValues[2].toDoubleOrNull()
+                    val unit = m.groupValues[3]
+                    val suffix = m.groupValues[4]
+                    val hasRelativeCue = prefix.isNotEmpty() || suffix.isNotEmpty() ||
+                        unit.startsWith("min") || unit.startsWith("hr") || unit.startsWith("hour")
+                    if (amount != null && hasRelativeCue) {
+                        val deltaMs = if (unit.startsWith("h")) (amount * 3_600_000.0).toLong() else (amount * 60_000.0).toLong()
+                        val negative = prefix.startsWith("-") || prefix.startsWith("earlier") || suffix == "earlier"
+                        val signedDelta = if (negative) -deltaMs else deltaMs
+                        val anchor = if (prefix == "in") nowMs else oldStartMs
+                        return anchor + signedDelta
+                    }
+                }
+
+                val cal = java.util.Calendar.getInstance()
+                val explicitTomorrow = lower.contains("tomorrow") || lower.contains("next day")
+                val explicitToday = lower.contains("today")
+                val targetDow = WEEKDAYS.entries.firstOrNull { Regex("\\b${it.key}\\b").containsMatchIn(lower) }?.value
+
+                when {
+                    explicitTomorrow -> {
+                        cal.timeInMillis = nowMs
+                        cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+                    }
+                    explicitToday -> cal.timeInMillis = nowMs
+                    targetDow != null -> {
+                        cal.timeInMillis = nowMs
+                        var daysUntil = (targetDow - cal.get(java.util.Calendar.DAY_OF_WEEK) + 7) % 7
+                        if (daysUntil == 0) daysUntil = 7
+                        cal.add(java.util.Calendar.DAY_OF_YEAR, daysUntil)
+                    }
+                    else -> cal.timeInMillis = if (oldStartMs > nowMs) oldStartMs else nowMs
+                }
+
+                val parsedClock = org.fossistant.assistant.features.TaskScheduler.parseTime(desc)
+                if (parsedClock != null) {
+                    cal.set(java.util.Calendar.HOUR_OF_DAY, parsedClock.first)
+                    cal.set(java.util.Calendar.MINUTE, parsedClock.second)
+                    cal.set(java.util.Calendar.SECOND, 0)
+                    cal.set(java.util.Calendar.MILLISECOND, 0)
+                    if (!explicitTomorrow && !explicitToday && targetDow == null && cal.timeInMillis <= nowMs) {
+                        cal.add(java.util.Calendar.DAY_OF_YEAR, 1)
+                    }
+                    return cal.timeInMillis
+                } else if (explicitTomorrow || targetDow != null) {
+                    val orig = java.util.Calendar.getInstance().apply { timeInMillis = oldStartMs }
+                    cal.set(java.util.Calendar.HOUR_OF_DAY, orig.get(java.util.Calendar.HOUR_OF_DAY))
+                    cal.set(java.util.Calendar.MINUTE, orig.get(java.util.Calendar.MINUTE))
+                    cal.set(java.util.Calendar.SECOND, 0)
+                    cal.set(java.util.Calendar.MILLISECOND, 0)
+                    return cal.timeInMillis
+                }
+            }
+            return oldStartMs + shiftMinutes * 60_000L
+        }
+
+        private val appSearchExecutor = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "Fossistant-AppSearch").apply { isDaemon = true }
+        }
     }
 
     data class DiscoveredAppCapability(
@@ -183,54 +270,102 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
         }
     }
 
+    private fun ensureCookbookLoaded() {
+        val ctx = context ?: return
+        if (cookbookLoadedFromDisk) return
+        synchronized(savedCookbookRecipes) {
+            if (cookbookLoadedFromDisk) return
+            runCatching {
+                val file = File(ctx.filesDir, "features/cookbook.json")
+                if (file.exists()) {
+                    val json = JSONObject(file.readText())
+                    val keys = json.keys()
+                    while (keys.hasNext()) {
+                        val k = keys.next()
+                        val arr = json.optJSONArray(k) ?: continue
+                        val steps = (0 until arr.length()).mapNotNull { idx ->
+                            arr.optString(idx)?.takeIf { it.isNotBlank() }
+                        }
+                        if (steps.isNotEmpty()) savedCookbookRecipes[k] = steps
+                    }
+                }
+            }.onFailure { AppLogger.w("AssistantBridge", "Couldn't read saved cookbook: ${it.message}") }
+            cookbookLoadedFromDisk = true
+        }
+    }
+
+    private fun persistCookbookToDisk() {
+        val ctx = context ?: return
+        synchronized(savedCookbookRecipes) {
+            runCatching {
+                val dir = File(ctx.filesDir, "features").apply { mkdirs() }
+                val file = File(dir, "cookbook.json")
+                val root = JSONObject()
+                for ((k, steps) in savedCookbookRecipes) {
+                    root.put(k, JSONArray(steps))
+                }
+                file.writeText(root.toString(2))
+            }.onFailure { AppLogger.w("AssistantBridge", "Couldn't save cookbook: ${it.message}") }
+        }
+    }
+
     /**
      * 3. Cookbook management: save recipes, view step-by-step recipes, transfer recipes between
      *    devices, or play instructional recipe videos on YouTube.
      */
-    fun manageCookbook(action: String, recipeName: String, stepsText: String? = null): String {
+    fun manageCookbook(action: String, recipeName: String, stepsText: String? = null): BridgeResult {
+        ensureCookbookLoaded()
         val key = recipeName.trim().lowercase().ifEmpty { "classic carbonara" }
         return when (action.lowercase()) {
             "save", "add" -> {
                 val steps = stepsText?.split(Regex("[.\n]+"))?.map { it.trim() }?.filter { it.isNotEmpty() }
                     ?: listOf("Prepare ingredients for $recipeName and cook to taste.")
                 savedCookbookRecipes[key] = steps
-                "Saved \"$recipeName\" (${steps.size} steps) to your Fossistant Cookbook."
+                persistCookbookToDisk()
+                BridgeResult(true, "Saved \"$recipeName\" (${steps.size} steps) to your Fossistant Cookbook.")
             }
             "steps", "show", "read" -> {
                 val steps = savedCookbookRecipes[key]
                 if (steps != null) {
-                    "Cookbook recipe for \"$recipeName\":\n" + steps.joinToString("\n")
+                    BridgeResult(true, "Cookbook recipe for \"$recipeName\":\n" + steps.joinToString("\n"))
                 } else {
-                    "Cookbook has ${savedCookbookRecipes.size} saved recipes (${savedCookbookRecipes.keys.joinToString()}). " +
-                        "Searching web & YouTube for step-by-step \"$recipeName\" recipe."
+                    BridgeResult(
+                        false,
+                        "\"$recipeName\" isn't saved in your cookbook yet (saved: ${savedCookbookRecipes.keys.joinToString()})."
+                    )
                 }
             }
             "transfer", "share" -> {
                 val steps = savedCookbookRecipes[key]?.joinToString("\n")
                     ?: "Recipe for $recipeName"
-                if (context != null) {
-                    try {
-                        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"
-                            putExtra(Intent.EXTRA_SUBJECT, "Cookbook Recipe: $recipeName")
-                            putExtra(Intent.EXTRA_TEXT, steps)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        context.startActivity(shareIntent)
-                    } catch (_: Throwable) {}
+                if (context == null) {
+                    return BridgeResult(true, "Prepared recipe \"$recipeName\" to share.")
                 }
-                "Transferring recipe \"$recipeName\" to target device."
+                val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_SUBJECT, "Cookbook Recipe: $recipeName")
+                    putExtra(Intent.EXTRA_TEXT, steps)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                if (launch(shareIntent)) {
+                    BridgeResult(true, "Opened share sheet for recipe \"$recipeName\".")
+                } else {
+                    BridgeResult(false, "No app on this device can receive the shared recipe \"$recipeName\".")
+                }
             }
             "video", "youtube" -> {
-                if (context != null) {
-                    try {
-                        val ytUri = Uri.parse("https://www.youtube.com/results?search_query=${Uri.encode("how to cook $recipeName recipe")}")
-                        context.startActivity(Intent(Intent.ACTION_VIEW, ytUri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    } catch (_: Throwable) {}
+                if (context == null) {
+                    return BridgeResult(true, "Searching video tutorial for \"$recipeName\".")
                 }
-                "Playing instructional recipe video for \"$recipeName\" on YouTube."
+                val ytUri = Uri.parse("https://www.youtube.com/results?search_query=${Uri.encode("how to cook $recipeName recipe")}")
+                val viewIntent = Intent(Intent.ACTION_VIEW, ytUri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (launch(viewIntent)) {
+                    BridgeResult(true, "Opened instructional recipe video for \"$recipeName\" on YouTube.")
+                } else {
+                    BridgeResult(false, "No app or browser is available to play recipe videos.")
+                }
             }
-            else -> "Cookbook recipes: ${savedCookbookRecipes.keys.joinToString(", ")}"
+            else -> BridgeResult(true, "Cookbook recipes: ${savedCookbookRecipes.keys.joinToString(", ")}")
         }
     }
 
@@ -369,17 +504,18 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
                     val matchedTitle = cursor.getString(1) ?: eventTitleQuery
                     val oldStart = cursor.getLong(2)
                     val oldEnd = cursor.getLong(3).takeIf { it > oldStart } ?: (oldStart + 3_600_000L)
-                    val deltaMs = shiftMinutes * 60_000L
+                    val durationMs = (oldEnd - oldStart).coerceAtLeast(15 * 60_000L)
+                    val newStart = parseRescheduleTargetMs(oldStart, newTimeDescription, shiftMinutes)
                     val values = ContentValues().apply {
-                        put(CalendarContract.Events.DTSTART, oldStart + deltaMs)
-                        put(CalendarContract.Events.DTEND, oldEnd + deltaMs)
+                        put(CalendarContract.Events.DTSTART, newStart)
+                        put(CalendarContract.Events.DTEND, newStart + durationMs)
                     }
                     val updateUri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId)
                     context.contentResolver.update(updateUri, values, null, null)
                     return BridgeResult(true, "Rescheduled \"$matchedTitle\" to $newTimeDescription.")
                 }
             }
-            BridgeResult(true, "Opened Calendar to reschedule \"$eventTitleQuery\" to $newTimeDescription.")
+            BridgeResult(false, "No calendar event matching \"$eventTitleQuery\" was found.")
         } catch (e: Exception) {
             BridgeResult(false, "Couldn't reschedule \"$eventTitleQuery\": ${e.message}")
         }
@@ -408,15 +544,39 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
     fun manageFamilyBell(action: String, timeSpec: String, announcement: String): String {
         return when (action.lowercase()) {
             "add", "schedule", "create" -> {
-                val bell = FamilyBellAnnouncement(timeSpec.ifBlank { "18:00" }, announcement.ifBlank { "Family Bell Reminder" })
+                val cleanTime = timeSpec.ifBlank { "18:00" }
+                val cleanMsg = announcement.ifBlank { "Family Bell Reminder" }
+                val bell = FamilyBellAnnouncement(cleanTime, cleanMsg)
                 scheduledFamilyBells.add(bell)
-                "Scheduled Family Bell at ${bell.timeSpec}: \"${bell.message}\""
+                val persisted = org.fossistant.assistant.FossistantApp.instance?.features?.let { features ->
+                    runCatching {
+                        features.scheduleFromTool(
+                            instruction = "Family Bell: $cleanMsg",
+                            time = cleanTime,
+                            repeat = "daily"
+                        )
+                    }.getOrNull()
+                }
+                if (persisted?.success == true) {
+                    "Scheduled persistent Family Bell at $cleanTime: \"$cleanMsg\""
+                } else {
+                    "Scheduled Family Bell at $cleanTime: \"$cleanMsg\""
+                }
             }
             else -> {
-                if (scheduledFamilyBells.isEmpty()) {
+                val persistedBells = org.fossistant.assistant.FossistantApp.instance?.features?.tasks?.items?.value
+                    ?.filter { it.enabled && it.instruction.startsWith("Family Bell:") }
+                    ?.map {
+                        FamilyBellAnnouncement(
+                            timeSpec = "%02d:%02d".format(it.hour, it.minute),
+                            message = it.instruction.removePrefix("Family Bell:").trim()
+                        )
+                    }
+                val activeBells = if (persistedBells != null) persistedBells else scheduledFamilyBells
+                if (activeBells.isEmpty()) {
                     "No Family Bell announcements currently scheduled."
                 } else {
-                    "Scheduled Family Bells:\n" + scheduledFamilyBells.joinToString("\n") {
+                    "Scheduled Family Bells:\n" + activeBells.joinToString("\n") {
                         "🔔 ${it.timeSpec} — ${it.message}"
                     }
                 }
@@ -505,50 +665,141 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
     fun checkTravelOrFlightStatus(flightOrTripQuery: String): BridgeResult =
         BridgeResult(false, "There's no live flight data source. Search the web for \"$flightOrTripQuery status\" instead.")
 
+    private data class ContactDataRow(
+        val contactId: Long,
+        val displayName: String,
+        val mimeType: String,
+        val data1: String,
+        val data4: String
+    )
+
     /**
-     * 16. Ask for rich information about your contacts (phone, email, address, birthday, notes).
+     * 16. Ask for rich information about your contacts (phone, email, address, organization, notes).
      */
-    fun getContactDetails(contactName: String): String {
+    fun getContactDetails(contactName: String): BridgeResult {
         val cleaned = contactName.trim()
-        if (context == null) {
-            return "Contact details for $cleaned: Phone +1-555-0199, Email ${cleaned.lowercase()}@example.com"
+        val ctx = context ?: return BridgeResult(
+            true,
+            "Contact details for $cleaned: Phone +1-555-0199, Email ${cleaned.lowercase()}@example.com"
+        )
+        if (cleaned.isEmpty()) {
+            return BridgeResult(false, "Please provide a contact name to look up.")
         }
-        val phone = resolveContactPhoneNumber(cleaned)
-        return "Contact info for $cleaned: Phone: $phone"
+        return try {
+            val projection = arrayOf(
+                ContactsContract.Data.CONTACT_ID,
+                ContactsContract.Data.DISPLAY_NAME,
+                ContactsContract.Data.MIMETYPE,
+                ContactsContract.Data.DATA1,
+                ContactsContract.Data.DATA4
+            )
+            val rows = mutableListOf<ContactDataRow>()
+            ctx.contentResolver.query(
+                ContactsContract.Data.CONTENT_URI,
+                projection,
+                "${ContactsContract.Data.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$cleaned%"),
+                null
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(0)
+                    val name = cursor.getString(1)?.takeIf { it.isNotBlank() } ?: continue
+                    val mime = cursor.getString(2).orEmpty()
+                    val data1 = cursor.getString(3).orEmpty().trim()
+                    val data4 = cursor.getString(4).orEmpty().trim()
+                    if (data1.isNotEmpty() || data4.isNotEmpty()) {
+                        rows.add(ContactDataRow(id, name, mime, data1, data4))
+                    }
+                }
+            }
+            val query = cleaned.lowercase()
+            val bestTier = rows.minOfOrNull { contactMatchTier(it.displayName, query) }
+                ?: return BridgeResult(false, "No contact named \"$cleaned\" found.")
+            val best = rows.filter { contactMatchTier(it.displayName, query) == bestTier }
+            val people = best.map { it.displayName }.distinct()
+            if (people.size > 1) {
+                return BridgeResult(
+                    false,
+                    "Several contacts match \"$cleaned\": ${people.take(4).joinToString(", ")}. Which one?"
+                )
+            }
+            val targetId = best.first().contactId
+            val displayName = best.first().displayName
+            val personRows = best.filter { it.contactId == targetId }
+            val phones = personRows
+                .filter { it.mimeType == ContactsContract.CommonDataKinds.Phone.CONTENT_ITEM_TYPE && it.data1.isNotEmpty() }
+                .map { it.data1 }.distinct()
+            val emails = personRows
+                .filter { it.mimeType == ContactsContract.CommonDataKinds.Email.CONTENT_ITEM_TYPE && it.data1.isNotEmpty() }
+                .map { it.data1 }.distinct()
+            val addresses = personRows
+                .filter { it.mimeType == ContactsContract.CommonDataKinds.StructuredPostal.CONTENT_ITEM_TYPE && it.data1.isNotEmpty() }
+                .map { it.data1.replace('\n', ' ') }.distinct()
+            val orgs = personRows
+                .filter { it.mimeType == ContactsContract.CommonDataKinds.Organization.CONTENT_ITEM_TYPE }
+                .mapNotNull { listOf(it.data4, it.data1).filter { s -> s.isNotEmpty() }.joinToString(" at ").ifBlank { null } }
+                .distinct()
+            val notes = personRows
+                .filter { it.mimeType == ContactsContract.CommonDataKinds.Note.CONTENT_ITEM_TYPE && it.data1.isNotEmpty() }
+                .map { it.data1.take(160) }.distinct()
+
+            val parts = mutableListOf<String>()
+            if (phones.isNotEmpty()) parts.add("Phone: ${phones.joinToString(", ")}")
+            if (emails.isNotEmpty()) parts.add("Email: ${emails.joinToString(", ")}")
+            if (addresses.isNotEmpty()) parts.add("Address: ${addresses.joinToString("; ")}")
+            if (orgs.isNotEmpty()) parts.add("Work: ${orgs.joinToString(", ")}")
+            if (notes.isNotEmpty()) parts.add("Notes: ${notes.joinToString(" | ")}")
+
+            if (parts.isEmpty()) {
+                BridgeResult(true, "Contact \"$displayName\" has no saved phone, email, or address details.")
+            } else {
+                BridgeResult(true, "Contact details for $displayName — ${parts.joinToString("; ")}")
+            }
+        } catch (_: SecurityException) {
+            BridgeResult(false, "Allow Contacts access so I can look up \"$cleaned\".")
+        }
     }
 
     /**
      * 17. Voice transactional actions: send a payment, make a reservation, or post to social media.
      */
-    fun performTransactionalVoiceAction(actionType: String, targetOrDetails: String): String {
-        if (context != null) {
-            try {
-                when (actionType.lowercase()) {
-                    "payment", "pay" -> {
-                        val walletIntent = context.packageManager.getLaunchIntentForPackage("com.google.android.apps.walletnfcrel")
-                            ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://pay.google.com"))
-                        walletIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        context.startActivity(walletIntent)
-                    }
-                    "reservation", "reserve", "book" -> {
-                        val uri = Uri.parse("geo:0,0?q=${Uri.encode("reserve table at $targetOrDetails")}")
-                        context.startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                    }
-                    "social", "post" -> {
-                        val share = Intent(Intent.ACTION_SEND).apply {
-                            type = "text/plain"
-                            putExtra(Intent.EXTRA_TEXT, targetOrDetails)
-                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        }
-                        context.startActivity(share)
-                    }
-                }
-            } catch (_: Throwable) {}
+    fun performTransactionalVoiceAction(actionType: String, targetOrDetails: String): BridgeResult {
+        val kind = actionType.lowercase()
+        if (context == null) {
+            val summary = when (kind) {
+                "payment", "pay" -> "Prepared payment action: $targetOrDetails"
+                "reservation", "reserve", "book" -> "Prepared reservation request for $targetOrDetails"
+                else -> "Prepared social media post: \"$targetOrDetails\""
+            }
+            return BridgeResult(true, summary)
         }
-        return when (actionType.lowercase()) {
-            "payment", "pay" -> "Prepared payment action: $targetOrDetails"
-            "reservation", "reserve", "book" -> "Prepared reservation request for $targetOrDetails"
-            else -> "Prepared social media post: \"$targetOrDetails\""
+        val intent = when (kind) {
+            "payment", "pay" -> {
+                (context.packageManager.getLaunchIntentForPackage("com.google.android.apps.walletnfcrel")
+                    ?: Intent(Intent.ACTION_VIEW, Uri.parse("https://pay.google.com")))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            "reservation", "reserve", "book" -> {
+                val uri = Uri.parse("geo:0,0?q=${Uri.encode("reserve table at $targetOrDetails")}")
+                Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            else -> {
+                Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TEXT, targetOrDetails)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+        }
+        return if (launch(intent)) {
+            val summary = when (kind) {
+                "payment", "pay" -> "Opened payment app for $targetOrDetails."
+                "reservation", "reserve", "book" -> "Opened reservation search for $targetOrDetails."
+                else -> "Opened share sheet to post: \"$targetOrDetails\""
+            }
+            BridgeResult(true, summary)
+        } else {
+            BridgeResult(false, "No app on this device can handle $actionType for \"$targetOrDetails\".")
         }
     }
 
@@ -668,17 +919,9 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
                 }
             }
             val query = cleaned.lowercase()
-            fun tier(name: String): Int {
-                val lower = name.lowercase()
-                return when {
-                    lower == query -> 0
-                    lower.split(Regex("\\s+")).any { it.startsWith(query) } -> 1
-                    else -> 2
-                }
-            }
-            val bestTier = rows.minOfOrNull { tier(it.first) }
+            val bestTier = rows.minOfOrNull { contactMatchTier(it.first, query) }
                 ?: return ContactMatch(null, cleaned, exact = false, problem = "No contact named \"$cleaned\" found.")
-            val best = rows.filter { tier(it.first) == bestTier }
+            val best = rows.filter { contactMatchTier(it.first, query) == bestTier }
             val people = best.map { it.first }.distinct()
             if (people.size > 1) {
                 return ContactMatch(
@@ -762,6 +1005,15 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
             }
         } catch (_: SecurityException) {
             BridgeResult(false, "Allow Calendar access so I can read your schedule.")
+        }
+    }
+
+    private fun contactMatchTier(name: String, query: String): Int {
+        val lower = name.lowercase()
+        return when {
+            lower == query -> 0
+            lower.split(WORD_SPLIT_REGEX).any { it.startsWith(query) } -> 1
+            else -> 2
         }
     }
 
@@ -907,24 +1159,26 @@ class AppShortcutsAndAssistantApiBridge(private val context: Context?) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
             return "AppSearch GlobalSearchSession requires Android 12+ (API 31+)."
         }
+        val appSearchManager = ctx.getSystemService(AppSearchManager::class.java)
+            ?: return "AppSearchManager unavailable."
         return try {
-            val appSearchManager = ctx.getSystemService(AppSearchManager::class.java)
-                ?: return "AppSearchManager unavailable."
-            val executor = Executors.newSingleThreadExecutor()
             val future = CompletableFuture<String>()
 
-            appSearchManager.createGlobalSearchSession(executor) { sessionResult ->
+            appSearchManager.createGlobalSearchSession(appSearchExecutor) { sessionResult ->
                 if (!sessionResult.isSuccess) {
                     future.complete("Could not open GlobalSearchSession: ${sessionResult.errorMessage}")
                     return@createGlobalSearchSession
                 }
-                val session = sessionResult.resultValue ?: return@createGlobalSearchSession
+                val session = sessionResult.resultValue ?: run {
+                    future.complete("AppSearch GlobalSearchSession unavailable.")
+                    return@createGlobalSearchSession
+                }
                 val spec = SearchSpec.Builder()
                     .setTermMatch(SearchSpec.TERM_MATCH_PREFIX)
                     .setResultCountPerPage(5)
                     .build()
                 val searchResults = session.search(query, spec)
-                searchResults.getNextPage(executor) { pageResult ->
+                searchResults.getNextPage(appSearchExecutor) { pageResult ->
                     if (pageResult.isSuccess) {
                         val items = pageResult.resultValue.orEmpty()
                         val formatted = if (items.isEmpty()) {

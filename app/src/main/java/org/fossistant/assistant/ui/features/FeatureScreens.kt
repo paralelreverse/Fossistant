@@ -234,6 +234,7 @@ internal fun RecorderScreen(onAskInChat: (String) -> Unit) {
 @Composable
 private fun RecordingDialog(rec: Recording, onAskInChat: () -> Unit, onDismiss: () -> Unit) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var showTranscript by remember { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -250,7 +251,12 @@ private fun RecordingDialog(rec: Recording, onAskInChat: () -> Unit, onDismiss: 
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     SecondaryButton("PDF", enabled = rec.transcript.isNotBlank()) {
                         val text = "# Summary\n${rec.summary}\n\n# Transcript\n${rec.transcript}"
-                        PdfExporter.export(context, rec.title, text).onSuccess { PdfExporter.open(context, it.uri) }
+                        scope.launch {
+                            val result = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                PdfExporter.export(context, rec.title, text)
+                            }
+                            result.onSuccess { PdfExporter.open(context, it.uri) }
+                        }
                     }
                     SecondaryButton("Ask", enabled = rec.transcript.isNotBlank(), onClick = onAskInChat)
                     // Offered when the summary failed or never ran (not while it's still working).
@@ -263,9 +269,12 @@ private fun RecordingDialog(rec: Recording, onAskInChat: () -> Unit, onDismiss: 
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
         dismissButton = {
             TextButton(onClick = {
-                java.io.File(rec.audioPath).delete()
+                val path = rec.audioPath
                 features.recordings.delete(rec.id)
                 onDismiss()
+                kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                    runCatching { java.io.File(path).delete() }
+                }
             }) { Text("Delete", color = Danger) }
         }
     )
@@ -646,7 +655,7 @@ internal fun ConnectorsScreen() {
     editing?.let { c ->
         var name by remember(c.id) { mutableStateOf(c.name) }
         var url by remember(c.id) { mutableStateOf(c.url) }
-        var token by remember(c.id) { mutableStateOf(c.token) }
+        var token by remember(c.id) { mutableStateOf(org.fossistant.assistant.util.SecretCipher.decrypt(c.token)) }
         AlertDialog(
             onDismissRequest = { editing = null },
             containerColor = Card,

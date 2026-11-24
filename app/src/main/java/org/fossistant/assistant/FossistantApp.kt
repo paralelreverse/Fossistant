@@ -6,9 +6,12 @@ import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.fossistant.assistant.engine.AiMemoryManager
-import org.fossistant.assistant.engine.DualModelRouter
 import org.fossistant.assistant.engine.FastMultilingualTtsEngine
 import org.fossistant.assistant.engine.GemmaLiteRtEngine
 import org.fossistant.assistant.engine.MultimodalChunkProcessor
@@ -20,8 +23,8 @@ import org.fossistant.assistant.model.WhisperModelChoice
 import org.fossistant.assistant.tools.DeviceAndWebToolExecutor
 
 /**
- * Application singleton managing the Dual-Model lifecycle, Fast 7-Language TTS Engine,
- * Whisper Multilingual STT Engine, Persistent On-Device AI Memory System, and 8GB RAM callbacks.
+ * Application singleton managing the Gemma 4 E2B engine, Multilingual TTS & Whisper STT engines,
+ * Persistent On-Device AI Memory System, and RAM trim callbacks.
  */
 class FossistantApp : Application() {
 
@@ -50,20 +53,21 @@ class FossistantApp : Application() {
     lateinit var toolExecutor: DeviceAndWebToolExecutor
         private set
 
-    lateinit var router: DualModelRouter
-        private set
-
     /** Skills, projects, scheduled tasks, connectors, recordings and Deep Research. */
     lateinit var features: org.fossistant.assistant.features.Features
         private set
 
     /** On-device image generation (Stable Diffusion 1.5 / LCM); its models download on first use. */
-    val imageGenEngine by lazy { org.fossistant.assistant.engine.ImageGenEngine(this) }
+    private val imageGenLazy = lazy { org.fossistant.assistant.engine.ImageGenEngine(this) }
+    val imageGenEngine by imageGenLazy
 
     /** Downloads Gemma (MTP build) and Whisper into private storage when this APK doesn't carry them (slim). */
     val modelDownloads by lazy { org.fossistant.assistant.engine.ModelDownloadManager(this) }
 
     private var appRescan: kotlinx.coroutines.Job? = null
+
+    @Volatile
+    private var initialWarmupFinished: Boolean = false
 
     /** Re-reads the app action list a few seconds after an app is installed, updated or removed. */
     private fun watchInstalledApps() {
@@ -76,6 +80,7 @@ class FossistantApp : Application() {
         }
         val receiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(context: Context, intent: android.content.Intent) {
+                org.fossistant.assistant.tools.FuzzyAppAndCommandMatcher.invalidateAppCache()
                 val index = toolExecutor.appActions ?: return
                 index.invalidate()
                 appRescan?.cancel()
@@ -105,12 +110,18 @@ class FossistantApp : Application() {
 
         loadPreferences(this)
 
-        val modelsDir = filesDir.resolve("models").apply { mkdirs() }
-        memoryManager = AiMemoryManager(storageDir = filesDir, context = applicationContext)
-        chatHistoryStore = org.fossistant.assistant.ui.ChatHistoryStore(filesDir)
+        filesDir.resolve("models").mkdirs()
+        memoryManager = AiMemoryManager(
+            storageDir = filesDir,
+            context = applicationContext,
+            eagerLoad = false,
+            asyncPersist = true
+        )
+        chatHistoryStore = org.fossistant.assistant.ui.ChatHistoryStore(filesDir, eagerLoad = false)
         ttsEngine = FastMultilingualTtsEngine(context = applicationContext)
         sttEngine = WhisperMultilingualSttEngine(context = applicationContext).apply {
             setHardwareBackend(whisperHardwareBackend)
+            audioToGemma = Companion.gemmaVoiceInput
         }
         toolExecutor = DeviceAndWebToolExecutor(context = applicationContext)
         watchInstalledApps()
@@ -125,16 +136,10 @@ class FossistantApp : Application() {
             limitCompute = Companion.limitCompute
             allowSpeculativeDecoding = Companion.useMtp
             strictToolCalls = Companion.strictToolCalls
+            nativeVoiceInput = Companion.gemmaVoiceInput
             aiName = customAiName
             customPersonalityInstructions = this@FossistantApp.let { Companion.customPersonalityInstructions }
         }
-        // Dropped models (Bonsai, MiniCPM, the community GPU+MTP Gemma): free their unpacked files,
-        // LiteRT GPU caches and saved llama.cpp state.
-        val droppedModels = listOf("Ternary-Bonsai", "MiniCPM5-2B_int4.litertlm", "MiniCPM-V", "gemma-4-E2B-it-web-mtp", "massive-multilingual-router")
-        listOf(modelsDir, filesDir.resolve("litertlm_compiled_shaders")).forEach { dir ->
-            dir.listFiles { f -> droppedModels.any { f.name.startsWith(it) } }?.forEach { it.delete() }
-        }
-        filesDir.resolve("llama_state").deleteRecursively()
         // First launch of an APK without Gemma: start on a model that's actually there.
         if (getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString("primary_model_choice", null) == null &&
             !gemmaEngine.isModelAvailable(primaryModelChoice)
@@ -144,15 +149,15 @@ class FossistantApp : Application() {
                 gemmaEngine.activeModel = available
             }
         }
-        router = DualModelRouter(
-            gemmaEngine = gemmaEngine,
-            toolExecutor = toolExecutor
+        features = org.fossistant.assistant.features.Features(
+            applicationContext,
+            gemmaEngine,
+            toolExecutor,
+            eagerLoad = false
         )
-        features = org.fossistant.assistant.features.Features(applicationContext, gemmaEngine, toolExecutor)
         org.fossistant.assistant.features.TaskScheduler.ensureChannels(this)
-        org.fossistant.assistant.features.TaskScheduler.scheduleAll(this)
 
-        // Wire Tier-2 Full Duplex & Real-Time Barge-In pipeline:
+        // Wire Full Duplex & Real-Time Barge-In pipeline:
         // 1. Forward raw TTS 16-bit PCM to Software Acoustic Echo Canceler (AEC)
         ttsEngine.onAudioPcmAvailable = { pcmChunk ->
             sttEngine.onTtsPlaybackAudioChunk(pcmChunk)
@@ -186,20 +191,62 @@ class FossistantApp : Application() {
         }
         sttEngine.ttsAudioLevelProvider = { ttsEngine.ttsAudioLevel.value }
 
-        // Read the installed apps' shortcuts and App Actions before the first chat needs them.
-        appScope.launch(Dispatchers.IO) { toolExecutor.appActions?.actions() }
+        // Cancel deferred background model unload (and re-warm if previously trimmed) when any UI resumes.
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityResumed(activity: android.app.Activity) {
+                if (::gemmaEngine.isInitialized) {
+                    gemmaEngine.cancelDeferredMemoryRelease()
+                    if (initialWarmupFinished &&
+                        !gemmaEngine.isNativeModelLoaded &&
+                        !gemmaEngine.isGeneratingActive &&
+                        !gemmaEngine.isLoadingMemory.value
+                    ) {
+                        appScope.launch(Dispatchers.IO) {
+                            gemmaEngine.ensureInitialized()
+                        }
+                    }
+                }
+            }
+            override fun onActivityCreated(a: android.app.Activity, b: android.os.Bundle?) {}
+            override fun onActivityStarted(a: android.app.Activity) {}
+            override fun onActivityPaused(a: android.app.Activity) {}
+            override fun onActivityStopped(a: android.app.Activity) {}
+            override fun onActivitySaveInstanceState(a: android.app.Activity, b: android.os.Bundle) {}
+            override fun onActivityDestroyed(a: android.app.Activity) {}
+        })
 
-        // Asynchronously pre-warm native neural engines on background IO
+        // Load lightweight JSON stores off the Main thread; Gemma awaits this before building its first
+        // Conversation so memory facts & MCP connectors are already populated (no first-turn rebuild).
+        val storesLoaded = appScope.async(Dispatchers.IO) {
+            memoryManager.loadIfNeeded()
+            chatHistoryStore.loadIfNeeded()
+            features.loadAllStoresAndMigrate()
+            org.fossistant.assistant.features.TaskScheduler.scheduleAll(this@FossistantApp)
+        }
+
+        // Index installed app shortcuts independently so PackageManager queries never delay startup.
         appScope.launch(Dispatchers.IO) {
-            sttEngine.switchModel(whisperModelChoice)
+            toolExecutor.appActions?.actions()
+        }
+
+        // Pre-warm Gemma and Whisper in parallel instead of blocking Gemma behind Whisper loading.
+        appScope.launch(Dispatchers.IO) {
+            runCatching { storesLoaded.await() }
             gemmaEngine.ensureInitialized()
+            initialWarmupFinished = true
             if (BuildConfig.BUNDLES_MODELS) {
-                // Unpack every model this APK carries once, so a later slim update (no models in the APK), or
-                // another model APK installed over this one, can still use all of them.
-                WhisperModelChoice.entries.forEach { sttEngine.resolveOrExtractModelFile(it) }
+                // Unpack every LLM this APK carries once so a later slim update can still use all of them.
                 PrimaryLlmModel.entries
                     .filter { org.fossistant.assistant.util.BundledModels.contains(this@FossistantApp, it.filename) }
                     .forEach { gemmaEngine.resolveModelFile(model = it) }
+            }
+        }
+        appScope.launch(Dispatchers.IO) {
+            if (!Companion.gemmaVoiceInput) {
+                sttEngine.switchModel(whisperModelChoice)
+            }
+            if (BuildConfig.BUNDLES_MODELS) {
+                WhisperModelChoice.entries.forEach { sttEngine.resolveOrExtractModelFile(it) }
             }
         }
 
@@ -210,22 +257,86 @@ class FossistantApp : Application() {
         }
     }
 
+    @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
-        // Once Gemma 4 E2B is loaded after Tier-1 Router calls on it, keep it in memory until the app is closed.
+        if (level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            if (imageGenLazy.isInitialized()) imageGenEngine.release()
+            return
+        }
+        val lowOrBackground =
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW ||
+                level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND
+        if (!lowOrBackground) return
+
+        val immediateGemmaRelease =
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE
+
+        org.fossistant.assistant.util.AppLogger.i(
+            "FossistantApp",
+            "OS memory trim level=$level: ${if (immediateGemmaRelease) "releasing native caches immediately" else "scheduling deferred Gemma release"}"
+        )
+        if (imageGenLazy.isInitialized()) {
+            imageGenEngine.release()
+        }
+        if (::gemmaEngine.isInitialized && gemmaEngine.isNativeModelLoaded && !gemmaEngine.isGeneratingActive) {
+            if (immediateGemmaRelease) {
+                appScope.launch(Dispatchers.IO) {
+                    gemmaEngine.releaseMemory()
+                }
+            } else {
+                // Brief app switches shouldn't force a cold Gemma reload; release after 2 minutes idle.
+                gemmaEngine.scheduleDeferredMemoryRelease(delayMs = 120_000L)
+            }
+        }
+        val criticalMemory =
+            level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                level >= ComponentCallbacks2.TRIM_MEMORY_MODERATE
+        if (criticalMemory &&
+            ::sttEngine.isInitialized &&
+            !sttEngine.isListening.value &&
+            !WhisperMultilingualSttEngine.isActiveSttSession
+        ) {
+            appScope.launch(Dispatchers.IO) {
+                sttEngine.releaseWhisper()
+            }
+        }
     }
 
     override fun onTerminate() {
-        ttsEngine.shutdown()
-        sttEngine.stopListening()
-        kotlinx.coroutines.runBlocking {
-            gemmaEngine.releaseMemory()
+        if (::ttsEngine.isInitialized) ttsEngine.shutdown()
+        if (::sttEngine.isInitialized) sttEngine.stopListening()
+        if (imageGenLazy.isInitialized()) imageGenEngine.release()
+        if (::gemmaEngine.isInitialized) {
+            appScope.launch(Dispatchers.IO) {
+                gemmaEngine.releaseMemory()
+            }
         }
         super.onTerminate()
     }
 
+    internal fun syncRuntimeSettings() {
+        if (::gemmaEngine.isInitialized) {
+            gemmaEngine.aiName = Companion.customAiName
+            gemmaEngine.customPersonalityInstructions = Companion.customPersonalityInstructions
+            gemmaEngine.hardwareBackend = Companion.primaryHardwareBackend
+            gemmaEngine.limitCompute = Companion.limitCompute
+            gemmaEngine.allowSpeculativeDecoding = Companion.useMtp
+            gemmaEngine.strictToolCalls = Companion.strictToolCalls
+            gemmaEngine.nativeVoiceInput = Companion.gemmaVoiceInput
+        }
+        if (::sttEngine.isInitialized) {
+            sttEngine.audioToGemma = Companion.gemmaVoiceInput
+        }
+    }
+
     companion object {
         private const val PREFS_NAME = "fossistant_prefs"
+
+        private val _settingsRevision = MutableStateFlow(0L)
+        val settingsRevision: StateFlow<Long> = _settingsRevision.asStateFlow()
 
         @Volatile
         var instance: FossistantApp? = null
@@ -303,9 +414,17 @@ class FossistantApp : Application() {
         /** Keep the phone responsive while a model runs (fewer threads, lower priority, paced tokens). */
         @Volatile
         var limitCompute: Boolean = false
+
+        @Volatile
         var useMtp: Boolean = true
+
         /** LiteRT constrained decoding for tool calls (Gemma can only write well-formed calls). */
+        @Volatile
         var strictToolCalls: Boolean = true
+
+        /** Experimental: spoken prompts go to Gemma as audio (its own audio encoder) instead of through Whisper. */
+        @Volatile
+        var gemmaVoiceInput: Boolean = false
 
         /** The first-launch setup (language, voice, models, permissions, tour) has been finished. */
         @Volatile
@@ -347,13 +466,16 @@ class FossistantApp : Application() {
             limitCompute = prefs.getBoolean("limit_compute", false)
             useMtp = prefs.getBoolean("use_mtp", true)
             strictToolCalls = prefs.getBoolean("strict_tool_calls", true)
+            gemmaVoiceInput = prefs.getBoolean("gemma_voice_input", false)
             // Installs from before the setup existed already have a saved model choice: skip the setup for them.
             isOnboardingCompleted = prefs.getBoolean("is_onboarding_completed", prefs.contains("primary_model_choice"))
             downloadOverWifiOnly = prefs.getBoolean("download_wifi_only", true)
             preferredLanguageCode = prefs.getString("preferred_language", null)
                 ?: org.fossistant.assistant.model.SupportedLanguage.AUTO_CODE
             homeAssistantUrl = prefs.getString("home_assistant_url", "") ?: ""
-            homeAssistantToken = prefs.getString("home_assistant_token", "") ?: ""
+            homeAssistantToken = org.fossistant.assistant.util.SecretCipher.decrypt(
+                prefs.getString("home_assistant_token", "") ?: ""
+            )
         }
 
         fun savePreferences(context: Context) {
@@ -370,15 +492,21 @@ class FossistantApp : Application() {
                 .putString("whisper_model_choice", whisperModelChoice.name)
                 .putBoolean("whisper_tiny_is_back", true)
                 .putString("home_assistant_url", homeAssistantUrl)
-                .putString("home_assistant_token", homeAssistantToken)
+                .putString(
+                    "home_assistant_token",
+                    org.fossistant.assistant.util.SecretCipher.encrypt(homeAssistantToken)
+                )
                 .putBoolean("voice_duplex_mode", isVoiceDuplexMode)
                 .putBoolean("limit_compute", limitCompute)
                 .putBoolean("use_mtp", useMtp)
                 .putBoolean("strict_tool_calls", strictToolCalls)
+                .putBoolean("gemma_voice_input", gemmaVoiceInput)
                 .putBoolean("is_onboarding_completed", isOnboardingCompleted)
                 .putBoolean("download_wifi_only", downloadOverWifiOnly)
                 .putString("preferred_language", preferredLanguageCode)
                 .apply()
+            instance?.syncRuntimeSettings()
+            _settingsRevision.value = _settingsRevision.value + 1L
         }
     }
 }

@@ -4,18 +4,22 @@
 #include <mutex>
 #include <cstring>
 #include <thread>
+#include <unordered_map>
 #include "whisper.h"
+#include "ggml-backend.h"
 
 // NOTE: app/src/main/jniLibs/arm64-v8a/libwhisper_jni.so is prebuilt from this file; after editing it,
-// rebuild with scripts/build-whisper-jni.sh (whisper.cpp + Android NDK).
+// rebuild with scripts/build-whisper-jni.sh (whisper.cpp + Vulkan headers + Android NDK).
 
 static std::mutex g_whisper_mutex;
+static std::unordered_map<jlong, bool> g_whisper_gpu_map;
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_fossistant_assistant_engine_WhisperMultilingualSttEngine_nativeInitWhisper(
     JNIEnv* env,
     jobject /* thiz */,
-    jstring modelPath
+    jstring modelPath,
+    jboolean useGpu
 ) {
     std::lock_guard<std::mutex> lock(g_whisper_mutex);
     if (!modelPath) return 0L;
@@ -23,12 +27,34 @@ Java_org_fossistant_assistant_engine_WhisperMultilingualSttEngine_nativeInitWhis
     if (!path) return 0L;
 
     struct whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = false;   // built CPU-only (no Vulkan/OpenCL backend in libwhisper_jni.so)
-    cparams.flash_attn = true; // fused attention kernels: faster encoder/decoder on CPU
+    cparams.use_gpu = static_cast<bool>(useGpu);
+    cparams.flash_attn = true; // fused attention kernels: faster encoder/decoder
     struct whisper_context* ctx = whisper_init_from_file_with_params(path, cparams);
+    if (!ctx && cparams.use_gpu) {
+        cparams.use_gpu = false;
+        ctx = whisper_init_from_file_with_params(path, cparams);
+    }
     env->ReleaseStringUTFChars(modelPath, path);
 
-    return reinterpret_cast<jlong>(ctx);
+    const jlong handle = reinterpret_cast<jlong>(ctx);
+    if (ctx) {
+        const bool active_gpu = cparams.use_gpu &&
+            (ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
+             ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr);
+        g_whisper_gpu_map[handle] = active_gpu;
+    }
+    return handle;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_fossistant_assistant_engine_WhisperMultilingualSttEngine_nativeIsUsingGpu(
+    JNIEnv* /* env */,
+    jobject /* thiz */,
+    jlong handle
+) {
+    std::lock_guard<std::mutex> lock(g_whisper_mutex);
+    auto it = g_whisper_gpu_map.find(handle);
+    return (it != g_whisper_gpu_map.end() && it->second) ? JNI_TRUE : JNI_FALSE;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -41,6 +67,9 @@ Java_org_fossistant_assistant_engine_WhisperMultilingualSttEngine_nativeTranscri
     jstring langCode
 ) {
     std::lock_guard<std::mutex> lock(g_whisper_mutex);
+    if (handle == 0L || g_whisper_gpu_map.find(handle) == g_whisper_gpu_map.end()) {
+        return env->NewStringUTF("");
+    }
     auto* ctx = reinterpret_cast<struct whisper_context*>(handle);
     if (!ctx || !pcmSamples || sampleCount <= 0) {
         return env->NewStringUTF("");
@@ -117,6 +146,9 @@ Java_org_fossistant_assistant_engine_WhisperMultilingualSttEngine_nativeFreeWhis
     jlong handle
 ) {
     std::lock_guard<std::mutex> lock(g_whisper_mutex);
+    if (g_whisper_gpu_map.erase(handle) == 0) {
+        return;
+    }
     auto* ctx = reinterpret_cast<struct whisper_context*>(handle);
     if (ctx) {
         whisper_free(ctx);

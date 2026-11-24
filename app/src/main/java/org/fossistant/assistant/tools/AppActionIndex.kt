@@ -51,10 +51,19 @@ class AppActionIndex(private val context: Context) {
 
     @Volatile private var cache: List<AppAction> = emptyList()
     @Volatile private var builtAtMs = 0L
+    private val prefs by lazy {
+        runCatching { context.getSharedPreferences("fossistant_app_actions", Context.MODE_PRIVATE) }.getOrNull()
+    }
 
     /** Forget the list; the next [actions] call reads the apps again (called when an app is (un)installed). */
     fun invalidate() {
         builtAtMs = 0L
+    }
+
+    /** Non-blocking check for Gemma's tool-group setup (avoids stalling model init on a full PackageManager scan). */
+    fun hasIndexedActions(): Boolean {
+        if (builtAtMs > 0L) return cache.isNotEmpty()
+        return runCatching { prefs?.getBoolean("has_app_actions", true) }.getOrNull() ?: true
     }
 
     /** Every action, rebuilt after [invalidate] or after [REFRESH_MS]. */
@@ -67,6 +76,7 @@ class AppActionIndex(private val context: Context) {
                 cache
             }
             builtAtMs = now
+            runCatching { prefs?.edit()?.putBoolean("has_app_actions", cache.isNotEmpty())?.apply() }
             AppLogger.i(TAG, "Indexed ${cache.size} app actions (${cache.count { it.source == Source.CAPABILITY }} App Actions)")
         }
         return cache

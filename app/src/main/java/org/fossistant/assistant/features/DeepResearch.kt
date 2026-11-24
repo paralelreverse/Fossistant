@@ -4,7 +4,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.fossistant.assistant.engine.GemmaLiteRtEngine
 import org.fossistant.assistant.model.ToolCallRequest
@@ -36,7 +35,7 @@ class DeepResearch(
 
     data class WebResult(val title: String, val url: String, val snippet: String)
 
-    private val http = OkHttpClient.Builder()
+    private val http = org.fossistant.assistant.util.SharedHttp.client.newBuilder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(12, TimeUnit.SECONDS)
         .followRedirects(true)

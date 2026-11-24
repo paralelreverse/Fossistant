@@ -183,72 +183,28 @@ class AssistOverlayActivity : ComponentActivity() {
                 }
             }
 
-            // Hands-free continuous turn-taking in popup mode
-            LaunchedEffect(
-                uiState.isListeningVoice,
-                uiState.isVoiceMutedByUser,
-                uiState.isGenerating,
-                uiState.isTtsSpeaking,
-                uiState.isReasoning,
-                isScreenResumed
-            ) {
-                if (isScreenResumed &&
-                    !uiState.isListeningVoice &&
-                    !uiState.isVoiceMutedByUser &&
-                    !uiState.isGenerating &&
-                    !uiState.isTtsSpeaking &&
-                    !uiState.isReasoning
-                ) {
-                    if (ContextCompat.checkSelfPermission(
-                            this@AssistOverlayActivity,
-                            Manifest.permission.RECORD_AUDIO
-                        ) == PackageManager.PERMISSION_GRANTED
-                    ) {
-                        startVoiceCapture()
-                    }
-                }
-            }
+            var isCircleOverlayActive by remember { mutableStateOf(false) }
 
-            // Safety net: if popup sits idle with the microphone off, start listening again.
-            LaunchedEffect(isScreenResumed) {
-                while (isScreenResumed) {
-                    kotlinx.coroutines.delay(1200L)
-                    val s = viewModel.uiState.value
-                    val idle = !s.isVoiceMutedByUser && !s.isGenerating && !s.isTtsSpeaking && !s.isReasoning
-                    if (idle && !viewModel.sttEngine.isListening.value &&
-                        ContextCompat.checkSelfPermission(this@AssistOverlayActivity, Manifest.permission.RECORD_AUDIO) ==
-                        PackageManager.PERMISSION_GRANTED
-                    ) {
-                        startVoiceCapture()
-                    }
-                }
-            }
-
-            var showScreenChoice by remember { mutableStateOf(false) }
-            if (showScreenChoice) {
-                ScreenShareChoiceDialog(
-                    hasAssistScreenshot = FossistantApp.lastCapturedScreenshotJpeg != null &&
-                        System.currentTimeMillis() - FossistantApp.lastCapturedScreenshotAtMs < 10 * 60 * 1000L,
-                    onAskAboutScreen = {
-                        showScreenChoice = false
-                        if (viewModel.attachAssistScreenshot()) {
-                            viewModel.sendPrompt("What's on my screen? Help me with it.", stayInVoiceMode = true, forceSpeakResponse = true)
-                        } else {
-                            viewModel.reportError("No screenshot from the assist gesture. Turn on \"Use screenshot\" in Settings > Apps > Default apps > Digital assistant, or use live sharing.")
-                        }
-                    },
-                    onShareLive = {
-                        showScreenChoice = false
-                        startLiveScreenShare()
-                    },
-                    onDismiss = { showScreenChoice = false }
-                )
-            }
-
-            AssistOverlayScreen(
+            org.fossistant.assistant.ui.components.VoiceTurnTakingEffects(
+                context = this@AssistOverlayActivity,
+                viewModel = viewModel,
                 uiState = uiState,
-                onScreenShareAction = { showScreenChoice = true },
-                latestAssistantMessage = uiState.messages.lastOrNull { !it.isUser && it.id != "welcome" },
+                isActiveSurface = isScreenResumed && !isCircleOverlayActive,
+                watchdogIntervalMs = 1200L,
+                logTag = "AssistOverlay",
+                onStartListening = { startVoiceCapture() }
+            )
+
+            ScreenSearchAndCircleHost(
+                viewModel = viewModel,
+                uiState = uiState,
+                onShareLive = { startLiveScreenShare() },
+                onCircleOverlayActiveChange = { isCircleOverlayActive = it }
+            ) { openScreenTools ->
+                AssistOverlayScreen(
+                    uiState = uiState,
+                    onScreenShareAction = openScreenTools,
+                    latestAssistantMessage = uiState.messages.lastOrNull { !it.isUser && it.id != "welcome" },
                 onMicMuteToggle = {
                     if (uiState.isListeningVoice) {
                         viewModel.stopVoiceCapture()
@@ -320,6 +276,7 @@ class AssistOverlayActivity : ComponentActivity() {
                     finish()
                 }
             )
+            }
         }
     }
 
@@ -345,41 +302,11 @@ class AssistOverlayActivity : ComponentActivity() {
     }
 
     private fun startVoiceCapture() {
-        viewModel.setVoiceListeningState(
-            listening = true,
-            partialText = "Listening with Whisper...",
-            enterVoiceScreenMode = false
-        )
-        val continuous = FossistantApp.isVoiceDuplexMode
-        viewModel.sttEngine.startListening(
+        viewModel.startVoiceCapture(
             scope = lifecycleScope,
             language = viewModel.uiState.value.selectedLanguage,
-            continuous = continuous,
-            onPartial = { partial ->
-                viewModel.setVoiceListeningState(
-                    listening = true,
-                    partialText = partial,
-                    enterVoiceScreenMode = false
-                )
-            },
-            onError = { error ->
-                org.fossistant.assistant.util.AppLogger.w("AssistOverlay", "Listening stopped: $error")
-                viewModel.setVoiceListeningState(false, enterVoiceScreenMode = false)
-            },
-            onFinalResult = { transcript ->
-                if (transcript.isNotBlank()) {
-                    if (!continuous) {
-                        viewModel.sttEngine.stopListening()
-                    }
-                    viewModel.sendPrompt(
-                        rawPrompt = transcript,
-                        stayInVoiceMode = true,
-                        forceSpeakResponse = true
-                    )
-                } else if (!continuous) {
-                    viewModel.setVoiceListeningState(false, enterVoiceScreenMode = false)
-                }
-            }
+            continuous = FossistantApp.isVoiceDuplexMode,
+            enterVoiceScreenMode = false
         )
     }
 
@@ -1053,33 +980,4 @@ private fun CircularQuickActionButton(
             modifier = Modifier.size(20.dp)
         )
     }
-}
-
-@Composable
-internal fun ScreenShareChoiceDialog(
-    hasAssistScreenshot: Boolean,
-    onAskAboutScreen: () -> Unit,
-    onShareLive: () -> Unit,
-    onDismiss: () -> Unit
-) {
-    androidx.compose.material3.AlertDialog(
-        onDismissRequest = onDismiss,
-        containerColor = Color(0xFF101420),
-        title = { Text("Your screen", color = Color.White) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text(
-                    if (hasAssistScreenshot) "Ask about the screen that was open when you called me, or share your screen live while you use the phone."
-                    else "Share your screen live: I shrink to a bubble, you use the phone, and I see the screen every time you ask something.",
-                    color = Color(0xFFCBD5E1),
-                    fontSize = 14.sp
-                )
-            }
-        },
-        confirmButton = { TextButton(onClick = onShareLive) { Text("Share live") } },
-        dismissButton = {
-            if (hasAssistScreenshot) TextButton(onClick = onAskAboutScreen) { Text("Ask about this screen") }
-            else TextButton(onClick = onDismiss) { Text("Cancel") }
-        }
-    )
 }

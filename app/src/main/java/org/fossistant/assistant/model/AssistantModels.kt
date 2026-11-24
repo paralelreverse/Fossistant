@@ -7,11 +7,9 @@ import kotlinx.serialization.Serializable
  */
 @Serializable
 enum class ModelTier(val displayName: String, val ramFootprintMb: Int) {
-    /** A confirmed call / text / app action, run without Gemma (old chats saved it under the router's name). */
-    @kotlinx.serialization.SerialName("AMAZON_MASSIVE_ROUTER")
-    DIRECT_ACTION("Direct action", 0),
-    GEMMA_E2B_QAT_MTP("Gemma 4 E2B QAT (LiteRT-LM)", 1050),
-    LFM3_VL_2B("Liquid LFM3-VL-2B (llama.cpp + libmtmd)", 1450)
+    /** A confirmed call / text / app action executed directly without running a new LLM turn. */
+    DIRECT_ACTION("Direct Action", 0),
+    GEMMA_E2B_QAT_MTP("Gemma 4 E2B QAT + MTP", 2580)
 }
 
 /**

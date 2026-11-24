@@ -20,11 +20,9 @@ import android.service.voice.VoiceInteractionSessionService
 import android.speech.RecognitionService
 import android.view.View
 import android.view.WindowManager
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -42,13 +40,13 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.fossistant.assistant.FossistantApp
 import org.fossistant.assistant.features.LiveScreenShareService
 import org.fossistant.assistant.ui.AssistantViewModel
 import org.fossistant.assistant.ui.overlay.AssistOverlayActivity
 import org.fossistant.assistant.ui.overlay.AssistOverlayScreen
-import org.fossistant.assistant.ui.overlay.ScreenShareChoiceDialog
+import org.fossistant.assistant.ui.overlay.ScreenSearchAndCircleHost
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
@@ -183,78 +181,31 @@ class FossistantVoiceInteractionSession(context: Context) :
             setContent {
                 val uiState by viewModel.uiState.collectAsState()
 
-                // Hands-free continuous turn-taking while the assistant session popup is shown
-                LaunchedEffect(
-                    uiState.isListeningVoice,
-                    uiState.isVoiceMutedByUser,
-                    uiState.isGenerating,
-                    uiState.isTtsSpeaking,
-                    uiState.isReasoning,
-                    isSessionShown
-                ) {
-                    if (isSessionShown &&
-                        !uiState.isListeningVoice &&
-                        !uiState.isVoiceMutedByUser &&
-                        !uiState.isGenerating &&
-                        !uiState.isTtsSpeaking &&
-                        !uiState.isReasoning
-                    ) {
-                        if (ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.RECORD_AUDIO
-                            ) == PackageManager.PERMISSION_GRANTED
-                        ) {
-                            startVoiceCapture()
-                        }
-                    }
-                }
+                var isCircleOverlayActive by androidx.compose.runtime.remember { mutableStateOf(false) }
 
-                // Safety net: if popup sits idle with the microphone off, start listening again.
-                LaunchedEffect(isSessionShown) {
-                    while (isSessionShown) {
-                        delay(1200L)
-                        val s = viewModel.uiState.value
-                        val idle = !s.isVoiceMutedByUser && !s.isGenerating && !s.isTtsSpeaking && !s.isReasoning
-                        if (idle && !viewModel.sttEngine.isListening.value &&
-                            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                            PackageManager.PERMISSION_GRANTED
-                        ) {
-                            startVoiceCapture()
-                        }
-                    }
-                }
-
-                var showScreenChoice by remember { mutableStateOf(false) }
-                if (showScreenChoice) {
-                    ScreenShareChoiceDialog(
-                        hasAssistScreenshot = FossistantApp.lastCapturedScreenshotJpeg != null &&
-                            System.currentTimeMillis() - FossistantApp.lastCapturedScreenshotAtMs < 10 * 60 * 1000L,
-                        onAskAboutScreen = {
-                            showScreenChoice = false
-                            if (viewModel.attachAssistScreenshot()) {
-                                viewModel.sendPrompt(
-                                    "What's on my screen? Help me with it.",
-                                    stayInVoiceMode = true,
-                                    forceSpeakResponse = true
-                                )
-                            } else {
-                                viewModel.reportError(
-                                    "No screenshot from the assist gesture. Turn on \"Use screenshot\" in Settings > Apps > Default apps > Digital assistant, or use live sharing."
-                                )
-                            }
-                        },
-                        onShareLive = {
-                            showScreenChoice = false
-                            startLiveScreenShareFromSession()
-                        },
-                        onDismiss = { showScreenChoice = false }
-                    )
-                }
-
-                AssistOverlayScreen(
+                org.fossistant.assistant.ui.components.VoiceTurnTakingEffects(
+                    context = context,
+                    viewModel = viewModel,
                     uiState = uiState,
-                    onScreenShareAction = { showScreenChoice = true },
-                    latestAssistantMessage = uiState.messages.lastOrNull { !it.isUser && it.id != "welcome" },
+                    isActiveSurface = isSessionShown && !isCircleOverlayActive,
+                    watchdogIntervalMs = 1200L,
+                    logTag = "VoiceInteraction",
+                    onStartListening = { startVoiceCapture() }
+                )
+
+                ScreenSearchAndCircleHost(
+                    viewModel = viewModel,
+                    uiState = uiState,
+                    onShareLive = { startLiveScreenShareFromSession() },
+                    onCircleOverlayActiveChange = { active ->
+                        isCircleOverlayActive = active
+                        setImeInputMode(enableResize = active, showKeyboardImmediately = false)
+                    }
+                ) { openScreenTools ->
+                    AssistOverlayScreen(
+                        uiState = uiState,
+                        onScreenShareAction = openScreenTools,
+                        latestAssistantMessage = uiState.messages.lastOrNull { !it.isUser && it.id != "welcome" },
                     onMicMuteToggle = {
                         if (uiState.isListeningVoice) {
                             viewModel.stopVoiceCapture()
@@ -323,67 +274,43 @@ class FossistantVoiceInteractionSession(context: Context) :
                         }
                     },
                     onKeyboardToggle = { open ->
-                        window?.window?.let { win ->
-                            win.clearFlags(
-                                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                                    WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
-                            )
-                            win.setSoftInputMode(
-                                if (open) {
-                                    WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE or
-                                        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
-                                } else {
-                                    WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN or
-                                        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
-                                }
-                            )
-                        }
+                        setImeInputMode(enableResize = open, showKeyboardImmediately = open)
                     },
                     onDismiss = {
                         viewModel.stopVoiceAndTts()
                         hide()
                     }
                 )
+                }
             }
         }
     }
 
+    private fun setImeInputMode(enableResize: Boolean, showKeyboardImmediately: Boolean) {
+        window?.window?.let { win ->
+            win.clearFlags(
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM
+            )
+            win.setSoftInputMode(
+                if (enableResize) {
+                    (if (showKeyboardImmediately) WindowManager.LayoutParams.SOFT_INPUT_STATE_VISIBLE
+                    else WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED) or
+                        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                } else {
+                    WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN or
+                        WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN
+                }
+            )
+        }
+    }
+
     private fun startVoiceCapture() {
-        viewModel.setVoiceListeningState(
-            listening = true,
-            partialText = "Listening with Whisper...",
-            enterVoiceScreenMode = false
-        )
-        val continuous = FossistantApp.isVoiceDuplexMode
-        viewModel.sttEngine.startListening(
+        viewModel.startVoiceCapture(
             scope = lifecycleScope,
             language = viewModel.uiState.value.selectedLanguage,
-            continuous = continuous,
-            onPartial = { partial ->
-                viewModel.setVoiceListeningState(
-                    listening = true,
-                    partialText = partial,
-                    enterVoiceScreenMode = false
-                )
-            },
-            onError = { error ->
-                org.fossistant.assistant.util.AppLogger.w("VoiceInteraction", "Listening stopped: $error")
-                viewModel.setVoiceListeningState(false, enterVoiceScreenMode = false)
-            },
-            onFinalResult = { transcript ->
-                if (transcript.isNotBlank()) {
-                    if (!continuous) {
-                        viewModel.sttEngine.stopListening()
-                    }
-                    viewModel.sendPrompt(
-                        rawPrompt = transcript,
-                        stayInVoiceMode = true,
-                        forceSpeakResponse = true
-                    )
-                } else if (!continuous) {
-                    viewModel.setVoiceListeningState(false, enterVoiceScreenMode = false)
-                }
-            }
+            continuous = FossistantApp.isVoiceDuplexMode,
+            enterVoiceScreenMode = false
         )
     }
 
@@ -596,11 +523,18 @@ class FossistantVoiceInteractionSession(context: Context) :
 class FossistantRecognitionService : RecognitionService() {
     private val serviceScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main + kotlinx.coroutines.SupervisorJob())
     private var sttEngine: org.fossistant.assistant.engine.WhisperMultilingualSttEngine? = null
+    private var ownsSttEngine: Boolean = false
 
     override fun onCreate() {
         super.onCreate()
-        val app = application as? FossistantApp
-        sttEngine = org.fossistant.assistant.engine.WhisperMultilingualSttEngine(this)
+        val shared = (application as? FossistantApp)?.sttEngine
+        if (shared != null) {
+            sttEngine = shared
+            ownsSttEngine = false
+        } else {
+            sttEngine = org.fossistant.assistant.engine.WhisperMultilingualSttEngine(this)
+            ownsSttEngine = true
+        }
     }
 
     override fun onStartListening(intent: Intent?, listener: Callback?) {
@@ -647,7 +581,14 @@ class FossistantRecognitionService : RecognitionService() {
     }
 
     override fun onDestroy() {
-        sttEngine?.stopListening()
+        val engine = sttEngine
+        engine?.stopListening()
+        if (ownsSttEngine && engine != null) {
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                engine.releaseWhisper()
+            }
+        }
+        sttEngine = null
         serviceScope.cancel()
         super.onDestroy()
     }

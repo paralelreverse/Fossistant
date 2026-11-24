@@ -54,6 +54,9 @@ class VoiceWakeWordService : Service() {
     companion object {
         const val CHANNEL_ID = "fossistant_wake_word_channel"
         const val NOTIFICATION_ID = 2001
+        private val NON_WORD_SPACE_REGEX = Regex("[^\\p{L}\\p{N}\\s]+")
+        private val MULTI_SPACE_REGEX = Regex("\\s+")
+        private val GENERIC_WAKE_PREFIXES = setOf("hey", "okay", "ok", "hello", "dear", "please")
 
         fun startIfEnabled(context: Context) {
             if (FossistantApp.isVoiceTriggerEnabled &&
@@ -120,10 +123,11 @@ class VoiceWakeWordService : Service() {
             val shortBuf = ShortArray(1024)
             val speechAccumulator = PcmAccumulator(sampleRate * 4)
             var speechFrames = 0
+            var lastWakeCheckAtMs = 0L
 
             while (isActive && isRunning.get() && FossistantApp.isVoiceTriggerEnabled) {
-                // Yield microphone completely while active STT / Voice Mode is recording!
-                if (WhisperMultilingualSttEngine.isActiveSttSession) {
+                // Yield microphone completely while active STT / Voice Mode or Record Mode is recording!
+                if (shouldYieldMicrophone()) {
                     delay(120)
                     continue
                 }
@@ -171,7 +175,7 @@ class VoiceWakeWordService : Service() {
 
                     while (isActive && isRunning.get() &&
                         FossistantApp.isVoiceTriggerEnabled &&
-                        !WhisperMultilingualSttEngine.isActiveSttSession
+                        !shouldYieldMicrophone()
                     ) {
                         val read = activeRecord.read(shortBuf, 0, shortBuf.size)
                         if (read > 0) {
@@ -199,21 +203,25 @@ class VoiceWakeWordService : Service() {
                                     speechAccumulator.keepTail(keep)
                                 }
                             } else if (speechFrames >= 8 && speechAccumulator.size >= sampleRate / 2) {
-                                // Speech burst ended -> check if it matches the wake word!
+                                // Speech burst ended -> check if it matches the wake word (rate-limited to save CPU/battery).
+                                val nowMs = System.currentTimeMillis()
                                 val candidateSamples = speechAccumulator.toShortArray()
                                 speechAccumulator.clear()
                                 speechFrames = 0
 
-                                if (matchesWakePhrase(app, candidateSamples, sensitivity)) {
-                                    // Release mic BEFORE opening AssistOverlayActivity so the overlay can record!
-                                    runCatching {
-                                        activeRecord.stop()
-                                        activeRecord.release()
+                                if (nowMs - lastWakeCheckAtMs >= 700L) {
+                                    lastWakeCheckAtMs = nowMs
+                                    if (matchesWakePhrase(app, candidateSamples, sensitivity)) {
+                                        // Release mic BEFORE opening AssistOverlayActivity so the overlay can record!
+                                        runCatching {
+                                            activeRecord.stop()
+                                            activeRecord.release()
+                                        }
+                                        record = null
+                                        triggerWakeWordActivation()
+                                        delay(3500)
+                                        break
                                     }
-                                    record = null
-                                    triggerWakeWordActivation()
-                                    delay(3500)
-                                    break
                                 }
                             } else {
                                 speechAccumulator.clear()
@@ -241,35 +249,65 @@ class VoiceWakeWordService : Service() {
     ): Boolean {
         if (!matchesWakeCadence(samples, sensitivity)) return false
 
-        val stt = app?.sttEngine
-        if (stt != null) {
-            val transcript = stt.transcribePcm16(samples, samples.size).lowercase().trim()
-            if (transcript.isNotBlank()) {
-                val customPhrase = FossistantApp.wakeWordPhrase.lowercase().trim()
-                val aiNameLower = FossistantApp.customAiName.lowercase().trim()
-                val targetKeywords = buildList {
-                    if (customPhrase.isNotEmpty()) {
-                        add(customPhrase)
-                        customPhrase.split(" ").filter { it.length >= 4 }.forEach { add(it) }
+        val stt = app?.sttEngine ?: return false
+        val transcript = stt.transcribePcm16(samples, samples.size).lowercase().trim()
+        if (transcript.isBlank()) return false
+
+        val normalized = org.fossistant.assistant.tools.FuzzyAppAndCommandMatcher
+            .autocorrectTranscript(transcript)
+            .lowercase()
+            .replace(NON_WORD_SPACE_REGEX, " ")
+            .replace(MULTI_SPACE_REGEX, " ")
+            .trim()
+        if (normalized.isBlank()) return false
+
+        val words = normalized.split(' ').filter { it.isNotBlank() }
+        val customPhrase = FossistantApp.wakeWordPhrase
+            .lowercase()
+            .replace(NON_WORD_SPACE_REGEX, " ")
+            .replace(MULTI_SPACE_REGEX, " ")
+            .trim()
+        val aiNameLower = FossistantApp.customAiName
+            .lowercase()
+            .replace(NON_WORD_SPACE_REGEX, " ")
+            .replace(MULTI_SPACE_REGEX, " ")
+            .trim()
+
+        val targetPhrases = buildSet {
+            if (customPhrase.isNotEmpty()) {
+                add(customPhrase)
+                customPhrase.split(' ').filter { it.length >= 4 && it !in GENERIC_WAKE_PREFIXES }.forEach { add(it) }
+            }
+            if (aiNameLower.isNotEmpty()) {
+                add(aiNameLower)
+                add("hey $aiNameLower")
+                add("ok $aiNameLower")
+            }
+            add("fossistant")
+            add("assistant")
+        }
+
+        if (targetPhrases.any { phrase ->
+                if (' ' in phrase) " $normalized ".contains(" $phrase ")
+                else words.any { it == phrase }
+            }
+        ) {
+            return true
+        }
+
+        // At high sensitivity, allow close phonetic misspellings of the wake name itself, never arbitrary "hey ..."/"ok ...".
+        if (sensitivity >= 0.80f) {
+            val singleTargets = targetPhrases.filter { ' ' !in it && it.length >= 6 }
+            if (words.any { spoken ->
+                    spoken.length >= 5 && singleTargets.any { target ->
+                        org.fossistant.assistant.tools.FuzzyAppAndCommandMatcher.levenshteinDistance(spoken, target) <= 2
                     }
-                    if (aiNameLower.isNotEmpty()) {
-                        add(aiNameLower)
-                        add("hey $aiNameLower")
-                    }
-                    add("fossistant")
-                    add("assistant")
                 }
-                if (targetKeywords.any { transcript.contains(it) }) {
-                    return true
-                }
-                // If sensitivity is high (>= 0.80f) and Whisper heard a short 2-3 word greeting ("hey ..."), allow it
-                if (sensitivity >= 0.80f && (transcript.startsWith("hey ") || transcript.startsWith("ok "))) {
-                    return true
-                }
-                return false
+            ) {
+                return true
             }
         }
-        return sensitivity >= 0.75f
+        return false
     }
 
     private fun matchesWakeCadence(samples: ShortArray, sensitivity: Float): Boolean {
@@ -355,6 +393,10 @@ class VoiceWakeWordService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun shouldYieldMicrophone(): Boolean =
+        WhisperMultilingualSttEngine.isActiveSttSession ||
+            org.fossistant.assistant.features.RecordingService.state.value.isRecording
 }
 
 /**

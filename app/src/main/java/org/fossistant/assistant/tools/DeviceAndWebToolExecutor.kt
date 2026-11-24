@@ -19,7 +19,6 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.fossistant.assistant.model.ToolCallRequest
 import org.fossistant.assistant.model.ToolExecutionResult
@@ -50,11 +49,31 @@ class DeviceAndWebToolExecutor(
         tokenProvider = { org.fossistant.assistant.FossistantApp.homeAssistantToken }
     )
 
-    private val httpClient = OkHttpClient.Builder()
+    private val httpClient = org.fossistant.assistant.util.SharedHttp.client.newBuilder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .followRedirects(true)
         .build()
+
+    private val ssrfSafeHttpClient by lazy {
+        httpClient.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .dns(object : okhttp3.Dns {
+                override fun lookup(hostname: String): List<java.net.InetAddress> {
+                    val clean = hostname.trim().lowercase().removeSurrounding("[", "]")
+                    if (!org.fossistant.assistant.util.SharedHttp.isPublicHostnameLabel(clean)) {
+                        throw java.net.UnknownHostException("Blocked non-public host '$hostname'")
+                    }
+                    val addresses = java.net.InetAddress.getAllByName(clean).toList()
+                    if (addresses.isEmpty() || addresses.any { org.fossistant.assistant.util.SharedHttp.isPrivateOrLocalAddress(it) }) {
+                        throw java.net.UnknownHostException("Blocked private or local address for '$hostname'")
+                    }
+                    return addresses
+                }
+            })
+            .build()
+    }
 
     private val photoSearch by lazy { PhotoSearch(httpClient) }
 
@@ -226,7 +245,7 @@ class DeviceAndWebToolExecutor(
                     recipeName = request.arguments["recipe"].orEmpty(),
                     stepsText = request.arguments["steps"]
                 )
-                ToolExecutionResult("manage_cookbook", true, msg)
+                ToolExecutionResult("manage_cookbook", msg.success, msg.message)
             }
             "control_stopwatch" -> {
                 val msg = apiBridge.controlStopwatch(
@@ -329,14 +348,14 @@ class DeviceAndWebToolExecutor(
                 val msg = apiBridge.getContactDetails(
                     contactName = request.arguments["name"].orEmpty()
                 )
-                ToolExecutionResult("get_contact_info", true, msg)
+                ToolExecutionResult("get_contact_info", msg.success, msg.message)
             }
             "transactional_action" -> {
                 val msg = apiBridge.performTransactionalVoiceAction(
                     actionType = request.arguments["type"] ?: "payment",
                     targetOrDetails = request.arguments["details"].orEmpty()
                 )
-                ToolExecutionResult("transactional_action", true, msg)
+                ToolExecutionResult("transactional_action", msg.success, msg.message)
             }
             "search_web" -> searchWebLocal(
                 query = request.arguments["query"].orEmpty()
@@ -348,6 +367,10 @@ class DeviceAndWebToolExecutor(
                 url = request.arguments["url"].orEmpty()
             )
             "get_device_location" -> getDeviceLocation()
+            "screen_agent_action", "control_screen", "phone_use", "agent_action" -> performScreenAgentAction(
+                action = request.arguments["action"] ?: "read_screen",
+                targetText = request.arguments["target_text"] ?: request.arguments["text"] ?: request.arguments["target"]
+            )
             "find_app_actions" -> findAppActions(request.arguments["query"].orEmpty())
             "run_app_action" -> runAppAction(request.arguments["action_id"].orEmpty(), request.arguments["inputs"].orEmpty())
             else -> ToolExecutionResult(
@@ -564,9 +587,8 @@ class DeviceAndWebToolExecutor(
             .firstOrNull { runCatching { lm.isProviderEnabled(it) }.getOrDefault(false) } ?: return null
         val latch = java.util.concurrent.CountDownLatch(1)
         var result: android.location.Location? = null
-        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
         return try {
-            lm.getCurrentLocation(provider, null, executor) { location ->
+            lm.getCurrentLocation(provider, null, locationExecutor) { location ->
                 result = location
                 latch.countDown()
             }
@@ -574,8 +596,6 @@ class DeviceAndWebToolExecutor(
             result
         } catch (_: Exception) {
             null
-        } finally {
-            executor.shutdown()
         }
     }
 
@@ -602,8 +622,8 @@ class DeviceAndWebToolExecutor(
                 location.contains("my location", ignoreCase = true) ||
                 location.equals("here", ignoreCase = true)
 
-            var lat = 48.1486
-            var lon = 17.1077
+            var lat = 0.0
+            var lon = 0.0
             var resolvedName = "Current Location"
             var country = ""
 
@@ -649,8 +669,10 @@ class DeviceAndWebToolExecutor(
                 val windKmh = wJson.getDouble("wind_speed_10m")
                 val condition = decodeWmoWeatherCode(wJson.getInt("weather_code"))
                 val countrySuffix = if (country.isNotBlank()) " ($country)" else ""
-                val summary = "Weather in $resolvedName$countrySuffix: $condition, ${tempC}°C, humidity $humidity%, wind ${windKmh} km/h."
-                ToolExecutionResult("get_weather", true, summary, wJson.toString())
+                // Units written out as words: Gemma reads symbols and raw API fields aloud badly
+                // ("90.5 meters per second per" for "humidity 90%, wind 5 km/h"), so it gets this sentence only.
+                val summary = weatherSentence("$resolvedName$countrySuffix", condition, tempC, humidity, windKmh)
+                ToolExecutionResult("get_weather", true, summary)
             }
         } catch (e: Exception) {
             ToolExecutionResult("get_weather", false, "Weather lookup unavailable offline (${e.message}).")
@@ -886,7 +908,7 @@ class DeviceAndWebToolExecutor(
             var snippets = emptyList<String>()
 
             httpClient.newCall(request).execute().use { response ->
-                val html = response.body?.string().orEmpty()
+                val html = org.fossistant.assistant.util.SharedHttp.readCappedText(response.body, maxBytes = 512 * 1024)
                 val doc = Jsoup.parse(html)
                 snippets = doc.select(".result, .web-result").take(4).mapNotNull { element ->
                     val title = element.select(".result__title, .result__a").text().trim()
@@ -905,7 +927,7 @@ class DeviceAndWebToolExecutor(
                     .header("User-Agent", "Mozilla/5.0 (Android 15; Mobile)")
                     .build()
                 httpClient.newCall(liteRequest).execute().use { response ->
-                    val html = response.body?.string().orEmpty()
+                    val html = org.fossistant.assistant.util.SharedHttp.readCappedText(response.body, maxBytes = 512 * 1024)
                     val doc = Jsoup.parse(html)
                     val rows = doc.select("tr")
                     val liteResults = mutableListOf<String>()
@@ -988,23 +1010,43 @@ class DeviceAndWebToolExecutor(
                 if (!isSafePublicHost(host)) {
                     return@withContext ToolExecutionResult("fetch_webpage", false, "Refusing to read private or local network address '$host'.")
                 }
-                val response = Jsoup.connect(currentUrl)
-                    .userAgent("Mozilla/5.0 (Android 15; Mobile)")
-                    .timeout(8000)
-                    .followRedirects(false)
-                    .execute()
-                if (response.statusCode() in 300..399) {
-                    val location = response.header("Location")?.trim().orEmpty()
-                    if (location.isEmpty() || ++redirects > 4) {
-                        return@withContext ToolExecutionResult("fetch_webpage", false, "Too many or invalid redirects for $url.")
+                val request = Request.Builder()
+                    .url(currentUrl)
+                    .header("User-Agent", "Mozilla/5.0 (Android 15; Mobile)")
+                    .build()
+                var nextRedirectUrl: String? = null
+                var extractedResult: ToolExecutionResult? = null
+                ssrfSafeHttpClient.newCall(request).execute().use { response ->
+                    if (response.code in 300..399) {
+                        val location = response.header("Location")?.trim().orEmpty()
+                        if (location.isEmpty() || ++redirects > 4) {
+                            extractedResult = ToolExecutionResult("fetch_webpage", false, "Too many or invalid redirects for $url.")
+                        } else {
+                            nextRedirectUrl = parsed.resolve(location).toString()
+                        }
+                    } else if (!response.isSuccessful) {
+                        extractedResult = ToolExecutionResult("fetch_webpage", false, "HTTP ${response.code} reading $url")
+                    } else {
+                        val contentType = response.header("Content-Type")?.lowercase().orEmpty()
+                        if (contentType.isNotBlank() &&
+                            "text" !in contentType &&
+                            "html" !in contentType &&
+                            "xml" !in contentType &&
+                            "json" !in contentType
+                        ) {
+                            extractedResult = ToolExecutionResult("fetch_webpage", false, "Unsupported content type '$contentType' for $url")
+                        } else {
+                            val html = org.fossistant.assistant.util.SharedHttp.readCappedText(response.body, maxBytes = 512 * 1024)
+                            val doc = Jsoup.parse(html, currentUrl)
+                            doc.select("script, style, nav, footer, header, aside").remove()
+                            val text = doc.body()?.text().orEmpty().take(6000) // Cap at 6k chars to preserve KV-cache budget
+                            extractedResult = ToolExecutionResult("fetch_webpage", true, "Extracted ${text.length} chars from $url", text)
+                        }
                     }
-                    currentUrl = parsed.resolve(location).toString()
-                    continue
                 }
-                val doc = response.parse()
-                doc.select("script, style, nav, footer, header, aside").remove()
-                val text = doc.body()?.text().orEmpty().take(6000) // Cap at 6k chars to preserve 8GB RAM KV-cache budget
-                return@withContext ToolExecutionResult("fetch_webpage", true, "Extracted ${text.length} chars from $url", text)
+                extractedResult?.let { return@withContext it }
+                currentUrl = nextRedirectUrl
+                    ?: return@withContext ToolExecutionResult("fetch_webpage", false, "Failed to read URL $url")
             }
             @Suppress("UNREACHABLE_CODE")
             ToolExecutionResult("fetch_webpage", false, "Failed to read URL $url")
@@ -1015,35 +1057,94 @@ class DeviceAndWebToolExecutor(
 
     internal fun isSafePublicHost(host: String): Boolean {
         if (host.isBlank()) return false
-        val clean = host.removeSurrounding("[", "]")
-        if (clean == "localhost" || clean.endsWith(".localhost") || clean.endsWith(".local") || clean.endsWith(".internal")) {
-            return false
-        }
+        val clean = host.trim().lowercase().removeSurrounding("[", "]")
+        if (!org.fossistant.assistant.util.SharedHttp.isPublicHostnameLabel(clean)) return false
         val addresses = runCatching { java.net.InetAddress.getAllByName(clean) }.getOrNull()
         if (addresses.isNullOrEmpty()) return false
-        return addresses.all { addr -> !isPrivateOrLocalAddress(addr) }
+        return addresses.all { addr -> !org.fossistant.assistant.util.SharedHttp.isPrivateOrLocalAddress(addr) }
+    }
+    /**
+     * Executes on-device UI automation / screen reading via [FossistantAgentAccessibilityService].
+     */
+    fun performScreenAgentAction(action: String, targetText: String?): ToolExecutionResult {
+        val cleanAction = action.trim().lowercase().replace(' ', '_').replace('-', '_')
+        val service = FossistantAgentAccessibilityService.activeInstance
+        if (service == null) {
+            if (cleanAction == "read_screen") {
+                val assistDump = org.fossistant.assistant.FossistantApp.lastCapturedScreenContext
+                if (!assistDump.isNullOrBlank()) {
+                    return ToolExecutionResult("screen_agent_action", true, "Captured active screen context", assistDump)
+                }
+            }
+            if (context == null) {
+                return ToolExecutionResult("screen_agent_action", true, "Executed screen action '$cleanAction' on '$targetText' (test mode)")
+            }
+            return ToolExecutionResult(
+                "screen_agent_action",
+                false,
+                "Fossistant Accessibility Agent is not enabled. Please enable Fossistant in Android Settings > Accessibility to interact with and click screen elements."
+            )
+        }
+
+        return when (cleanAction) {
+            "read_screen" -> {
+                val dump = service.dumpCurrentScreenSummary()
+                ToolExecutionResult("screen_agent_action", true, "Captured active screen UI nodes", dump)
+            }
+            "click", "tap" -> {
+                val target = targetText.orEmpty().trim()
+                val clicked = service.clickNodeByText(target)
+                ToolExecutionResult(
+                    "screen_agent_action",
+                    clicked,
+                    if (clicked) "Clicked UI element '$target'" else "Element '$target' not found on screen"
+                )
+            }
+            "type", "input_text" -> {
+                val raw = targetText.orEmpty()
+                val (targetField, textToType) = if (raw.contains("::")) {
+                    raw.substringBefore("::").trim().takeIf { it.isNotBlank() } to raw.substringAfter("::")
+                } else {
+                    null to raw
+                }
+                val typed = service.inputTextIntoNode(textToType, targetField)
+                ToolExecutionResult(
+                    "screen_agent_action",
+                    typed,
+                    if (typed) "Typed text '$textToType' into input field" else "No editable input field found on screen to type '$textToType'"
+                )
+            }
+            "scroll_down" -> {
+                val scrolled = service.scrollActiveScreen(forward = true)
+                ToolExecutionResult(
+                    "screen_agent_action",
+                    scrolled,
+                    if (scrolled) "Scrolled screen down" else "No scrollable container found on screen"
+                )
+            }
+            "scroll_up" -> {
+                val scrolled = service.scrollActiveScreen(forward = false)
+                ToolExecutionResult(
+                    "screen_agent_action",
+                    scrolled,
+                    if (scrolled) "Scrolled screen up" else "No scrollable container found on screen"
+                )
+            }
+            "navigate_back", "back" -> {
+                val ok = service.performGlobalBack()
+                ToolExecutionResult("screen_agent_action", ok, if (ok) "Pressed system Back" else "Could not press system Back")
+            }
+            "navigate_home", "home" -> {
+                val ok = service.performGlobalHome()
+                ToolExecutionResult("screen_agent_action", ok, if (ok) "Returned to Home screen" else "Could not return to Home screen")
+            }
+            else -> ToolExecutionResult("screen_agent_action", false, "Unsupported screen action: $action")
+        }
     }
 
-    internal fun isPrivateOrLocalAddress(addr: java.net.InetAddress): Boolean {
-        if (addr.isAnyLocalAddress || addr.isLoopbackAddress || addr.isLinkLocalAddress ||
-            addr.isSiteLocalAddress || addr.isMulticastAddress
-        ) {
-            return true
-        }
-        val bytes = addr.address ?: return true
-        return when (bytes.size) {
-            4 -> {
-                val b0 = bytes[0].toInt() and 0xff
-                val b1 = bytes[1].toInt() and 0xff
-                // 100.64.0.0/10 (Carrier-Grade NAT / Tailscale) or 0.0.0.0/8
-                b0 == 0 || (b0 == 100 && (b1 and 0xc0) == 64)
-            }
-            16 -> {
-                val b0 = bytes[0].toInt() and 0xff
-                // Unique Local IPv6 (fc00::/7)
-                (b0 and 0xfe) == 0xfc
-            }
-            else -> true
+    companion object {
+        private val locationExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "Fossistant-Location").apply { isDaemon = true }
         }
     }
 }
@@ -1070,4 +1171,16 @@ internal fun briefingTimeNote(now: java.time.LocalDateTime = java.time.LocalDate
     return "Local time: $clock ($partOfDay). $framing Sound like a friend talking, in two or three relaxed sentences: " +
         "mention only what matters (round temperatures, skip humidity and empty parts unless asked), no lists, " +
         "no 'Is there anything I can help you with?'."
+}
+
+/**
+ * The weather as Gemma gets it: rounded numbers and units in words ("21 degrees Celsius, humidity 90 percent,
+ * wind 9 kilometres per hour"), which it can read aloud or translate without garbling symbols.
+ */
+internal fun weatherSentence(place: String, condition: String, tempC: Double, humidityPercent: Int, windKmh: Double): String {
+    val degrees = Math.round(tempC).toInt()
+    val wind = Math.round(windKmh).toInt()
+    val degreeWord = if (degrees == 1 || degrees == -1) "degree" else "degrees"
+    val kilometreWord = if (wind == 1) "kilometre" else "kilometres"
+    return "Weather in $place: $condition, $degrees $degreeWord Celsius, humidity $humidityPercent percent, wind $wind $kilometreWord per hour."
 }

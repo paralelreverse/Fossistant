@@ -20,6 +20,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 import java.io.File
+import java.io.InputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -27,7 +28,7 @@ import java.util.zip.ZipOutputStream
 /**
  * Export / import of everything the user created in the app, as one .zip: chats (with the pictures and files sent
  * in them), memories, settings, skills, projects, scheduled tasks, connectors and recordings. Models and caches are
- * left out. For moving to a new phone, or getting data back after a bad update.
+ * left out. Credentials (Home Assistant token, MCP access tokens) are scrubbed from exports for safety.
  */
 object DataBackup {
 
@@ -36,6 +37,11 @@ object DataBackup {
     private const val FORMAT = 1
     private const val PREFS_NAME = "fossistant_prefs"
     private const val ATTACHMENT_PREFIX = "fossistant-backup:attachments/"
+    private const val HOME_ASSISTANT_TOKEN_KEY = "home_assistant_token"
+    internal const val MAX_ZIP_ENTRIES = 2_000
+    internal const val MAX_TOTAL_UNCOMPRESSED_BYTES = 128L * 1024 * 1024
+    internal const val MAX_SINGLE_ENTRY_BYTES = 32L * 1024 * 1024
+    private val UNSAFE_FILENAME_REGEX = Regex("[^A-Za-z0-9._-]")
     private val json = Json { ignoreUnknownKeys = true }
 
     /** App data under filesDir that goes into a backup (relative paths; folders include their contents). */
@@ -69,8 +75,13 @@ object DataBackup {
                         val source = File(files, path)
                         if (!source.exists()) continue
                         source.walkTopDown().filter { it.isFile && !it.name.endsWith(".tmp") }.forEach { file ->
-                            zip.putNextEntry(ZipEntry("files/" + file.relativeTo(files).invariantSeparatorsPath))
-                            file.inputStream().use { it.copyTo(zip) }
+                            val relPath = file.relativeTo(files).invariantSeparatorsPath
+                            zip.putNextEntry(ZipEntry("files/$relPath"))
+                            if (relPath == "features/connectors.json") {
+                                zip.write(sanitizeConnectorBackupJson(file.readText()).toByteArray())
+                            } else {
+                                file.inputStream().use { it.copyTo(zip) }
+                            }
                             zip.closeEntry()
                             fileCount++
                         }
@@ -98,78 +109,141 @@ object DataBackup {
         runCatching {
             val files = context.filesDir
             val staging = File(context.cacheDir, "restore").apply { deleteRecursively(); mkdirs() }
-            val stagingCanonicalDir = staging.canonicalFile
-            val stagingPrefix = stagingCanonicalDir.path + File.separator
-            context.contentResolver.openInputStream(source)?.use { raw ->
-                ZipInputStream(raw.buffered()).use { zip ->
-                    while (true) {
-                        val entry = zip.nextEntry ?: break
-                        val out = File(stagingCanonicalDir, entry.name).canonicalFile
-                        // Never write outside the staging folder (strict directory-boundary zip-slip check).
-                        require(out == stagingCanonicalDir || out.path.startsWith(stagingPrefix)) {
-                            "Invalid backup entry ${entry.name}"
-                        }
-                        if (entry.isDirectory) out.mkdirs() else {
-                            out.parentFile?.mkdirs()
-                            out.outputStream().use { zip.copyTo(it) }
+            try {
+                context.contentResolver.openInputStream(source)?.use { raw ->
+                    extractZipSafely(raw, staging)
+                } ?: error("Couldn't open the backup file.")
+                val manifest = File(staging, "manifest.json").takeIf { it.exists() }
+                    ?.let { json.parseToJsonElement(it.readText()).jsonObject }
+                    ?: error("This isn't a Fossistant backup.")
+                require(manifest["app"]?.jsonPrimitive?.contentOrNull == "Fossistant") { "This isn't a Fossistant backup." }
+                val oldFilesDir = manifest["filesDir"]?.jsonPrimitive?.contentOrNull.orEmpty()
+
+                val attachmentsDir = File(files, "attachments").apply { mkdirs() }
+                // Parse and validate chats.json and settings.json in staging BEFORE overwriting any live files in filesDir.
+                val parsedChats = File(staging, "chats/chats.json").takeIf { it.exists() }?.let { file ->
+                    rewriteUris(json.parseToJsonElement(file.readText())) { uri ->
+                        if (uri.startsWith(ATTACHMENT_PREFIX)) {
+                            val safeName = sanitizeAttachmentFileName(uri.removePrefix(ATTACHMENT_PREFIX))
+                            if (safeName != null) File(attachmentsDir, safeName).absolutePath else ""
+                        } else uri
+                    }
+                }
+                val parsedSettings = File(staging, "settings.json").takeIf { it.exists() }?.let { file ->
+                    json.parseToJsonElement(file.readText()).jsonObject
+                }
+
+                // Attachments first, so chats can point at them.
+                var attachmentCount = 0
+                val attachmentsCanonicalPrefix = attachmentsDir.canonicalFile.path + File.separator
+                File(staging, "attachments").listFiles()?.forEach { file ->
+                    if (!file.isFile) return@forEach
+                    val safeName = sanitizeAttachmentFileName(file.name) ?: return@forEach
+                    val target = File(attachmentsDir, safeName).canonicalFile
+                    if (!target.path.startsWith(attachmentsCanonicalPrefix)) return@forEach
+                    file.copyTo(target, overwrite = true)
+                    attachmentCount++
+                }
+                var fileCount = 0
+                val stagingFilesRoot = File(staging, "files")
+                val filesCanonicalPrefix = files.canonicalFile.path + File.separator
+                stagingFilesRoot.takeIf { it.exists() }?.walkTopDown()?.filter { it.isFile }?.forEach { file ->
+                    val rel = file.relativeTo(stagingFilesRoot).invariantSeparatorsPath
+                    val isAllowedDataPath = DATA_PATHS.any { allowed ->
+                        rel == allowed || rel.startsWith("$allowed/")
+                    }
+                    if (!isAllowedDataPath) return@forEach
+                    val target = File(files, rel).canonicalFile
+                    if (!target.path.startsWith(filesCanonicalPrefix)) return@forEach
+                    target.parentFile?.mkdirs()
+                    // Recordings store absolute paths: move them to this phone's folder.
+                    if (file.name.endsWith(".json") && oldFilesDir.isNotEmpty()) {
+                        target.writeText(file.readText().replace(oldFilesDir, files.absolutePath))
+                    } else {
+                        file.copyTo(target, overwrite = true)
+                    }
+                    fileCount++
+                }
+                var chatCount = 0
+                if (parsedChats != null) {
+                    chatCount = (parsedChats as? JsonArray)?.size ?: 0
+                    File(files, "chats").mkdirs()
+                    File(files, "chats/chats.json").writeText(parsedChats.toString())
+                }
+                if (parsedSettings != null) {
+                    importPrefs(context, parsedSettings)
+                }
+                Summary(chatCount, attachmentCount, fileCount)
+            } finally {
+                staging.deleteRecursively()
+            }
+        }
+    }
+
+    /** Safely unpacks [input] into [stagingDir], enforcing zip-slip and zip-bomb bounds. */
+    internal fun extractZipSafely(
+        input: InputStream,
+        stagingDir: File,
+        maxEntries: Int = MAX_ZIP_ENTRIES,
+        maxTotalBytes: Long = MAX_TOTAL_UNCOMPRESSED_BYTES,
+        maxEntryBytes: Long = MAX_SINGLE_ENTRY_BYTES
+    ) {
+        val stagingCanonicalDir = stagingDir.canonicalFile
+        val stagingPrefix = stagingCanonicalDir.path + File.separator
+        var entries = 0
+        var totalBytes = 0L
+        val buffer = ByteArray(16 * 1024)
+        ZipInputStream(input.buffered()).use { zip ->
+            while (true) {
+                val entry = zip.nextEntry ?: break
+                entries++
+                require(entries <= maxEntries) { "Backup contains too many entries ($entries)." }
+                val out = File(stagingCanonicalDir, entry.name).canonicalFile
+                require(out == stagingCanonicalDir || out.path.startsWith(stagingPrefix)) {
+                    "Invalid backup entry ${entry.name}"
+                }
+                if (entry.isDirectory) {
+                    out.mkdirs()
+                } else {
+                    out.parentFile?.mkdirs()
+                    var entryBytes = 0L
+                    out.outputStream().use { dest ->
+                        while (true) {
+                            val read = zip.read(buffer)
+                            if (read < 0) break
+                            entryBytes += read
+                            totalBytes += read
+                            require(entryBytes <= maxEntryBytes) {
+                                "Backup entry ${entry.name} exceeds size limit."
+                            }
+                            require(totalBytes <= maxTotalBytes) {
+                                "Backup exceeds uncompressed size limit."
+                            }
+                            dest.write(buffer, 0, read)
                         }
                     }
                 }
-            } ?: error("Couldn't open the backup file.")
-            val manifest = File(staging, "manifest.json").takeIf { it.exists() }
-                ?.let { json.parseToJsonElement(it.readText()).jsonObject }
-                ?: error("This isn't a Fossistant backup.")
-            require(manifest["app"]?.jsonPrimitive?.contentOrNull == "Fossistant") { "This isn't a Fossistant backup." }
-            val oldFilesDir = manifest["filesDir"]?.jsonPrimitive?.contentOrNull.orEmpty()
-
-            // Parse and validate chats.json and settings.json in staging BEFORE overwriting any live files in filesDir.
-            val parsedChats = File(staging, "chats/chats.json").takeIf { it.exists() }?.let { file ->
-                rewriteUris(json.parseToJsonElement(file.readText())) { uri ->
-                    if (uri.startsWith(ATTACHMENT_PREFIX)) File(files, "attachments/" + uri.removePrefix(ATTACHMENT_PREFIX)).absolutePath else uri
-                }
+                zip.closeEntry()
             }
-            val parsedSettings = File(staging, "settings.json").takeIf { it.exists() }?.let { file ->
-                json.parseToJsonElement(file.readText()).jsonObject
-            }
-
-            // Attachments first, so chats can point at them.
-            var attachmentCount = 0
-            File(staging, "attachments").listFiles()?.forEach { file ->
-                file.copyTo(File(files, "attachments/${file.name}").apply { parentFile?.mkdirs() }, overwrite = true)
-                attachmentCount++
-            }
-            var fileCount = 0
-            val stagingFilesRoot = File(staging, "files")
-            val filesCanonicalPrefix = files.canonicalFile.path + File.separator
-            stagingFilesRoot.takeIf { it.exists() }?.walkTopDown()?.filter { it.isFile }?.forEach { file ->
-                val rel = file.relativeTo(stagingFilesRoot).invariantSeparatorsPath
-                val isAllowedDataPath = DATA_PATHS.any { allowed ->
-                    rel == allowed || rel.startsWith("$allowed/")
-                }
-                if (!isAllowedDataPath) return@forEach
-                val target = File(files, rel).canonicalFile
-                if (!target.path.startsWith(filesCanonicalPrefix)) return@forEach
-                target.parentFile?.mkdirs()
-                // Recordings store absolute paths: move them to this phone's folder.
-                if (file.name.endsWith(".json") && oldFilesDir.isNotEmpty()) {
-                    target.writeText(file.readText().replace(oldFilesDir, files.absolutePath))
-                } else {
-                    file.copyTo(target, overwrite = true)
-                }
-                fileCount++
-            }
-            var chatCount = 0
-            if (parsedChats != null) {
-                chatCount = (parsedChats as? JsonArray)?.size ?: 0
-                File(files, "chats").mkdirs()
-                File(files, "chats/chats.json").writeText(parsedChats.toString())
-            }
-            if (parsedSettings != null) {
-                importPrefs(context, parsedSettings)
-            }
-            staging.deleteRecursively()
-            Summary(chatCount, attachmentCount, fileCount)
         }
+    }
+
+    internal fun sanitizeAttachmentFileName(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty() || trimmed == "." || trimmed == "..") return null
+        if ('/' in trimmed || '\\' in trimmed || '\u0000' in trimmed || ".." in trimmed) return null
+        val sanitized = trimmed.replace(UNSAFE_FILENAME_REGEX, "_").takeLast(120)
+        if (sanitized.isEmpty() || sanitized == "." || sanitized == "..") return null
+        return sanitized
+    }
+
+    internal fun sanitizeConnectorBackupJson(rawJson: String): String {
+        val array = runCatching { json.parseToJsonElement(rawJson) as? JsonArray }.getOrNull() ?: return "[]"
+        val stripped = JsonArray(array.map { element ->
+            val obj = element as? JsonObject ?: return@map element
+            JsonObject(obj.mapValues { (k, v) -> if (k == "token") JsonPrimitive("") else v })
+        })
+        return stripped.toString()
     }
 
     /** Relaunches the app so every store reloads the restored data. */
@@ -211,6 +285,7 @@ object DataBackup {
 
     private fun exportPrefs(context: Context): JsonObject = buildJsonObject {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).all.forEach { (key, value) ->
+            if (key == HOME_ASSISTANT_TOKEN_KEY) return@forEach
             when (value) {
                 is Boolean -> put(key, value)
                 is Int -> put(key, value)

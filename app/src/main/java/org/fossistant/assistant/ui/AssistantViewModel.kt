@@ -6,6 +6,7 @@ import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,7 +15,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.fossistant.assistant.FossistantApp
-import org.fossistant.assistant.engine.DualModelRouter
 import org.fossistant.assistant.engine.FastMultilingualTtsEngine
 import org.fossistant.assistant.engine.WhisperMultilingualSttEngine
 import org.fossistant.assistant.model.AiCharacterPersona
@@ -25,7 +25,6 @@ import org.fossistant.assistant.model.HardwareInferenceBackend
 import org.fossistant.assistant.model.MediaAttachment
 import org.fossistant.assistant.model.MediaModality
 import org.fossistant.assistant.model.MemoryFact
-import org.fossistant.assistant.model.LlmRuntimeEngine
 import org.fossistant.assistant.model.PrimaryLlmModel
 import org.fossistant.assistant.model.ResponseLengthPreference
 import org.fossistant.assistant.model.SupportedLanguage
@@ -87,7 +86,7 @@ data class AssistantUiState(
     val gemmaSpeedStatus: String = "Idle",
     val gemmaTokPerSec: Float = 0f,
     val errorMessage: String? = null,
-    // Voice Trigger (Wake Word) & Fast 7-Language TTS Voice settings
+    // Voice Trigger (Wake Word) & Multilingual TTS Voice settings
     val voiceTriggerEnabled: Boolean = FossistantApp.isVoiceTriggerEnabled,
     val wakeWordPhrase: String = FossistantApp.wakeWordPhrase,
     val wakeWordSensitivity: Float = FossistantApp.wakeWordSensitivity,
@@ -119,6 +118,7 @@ data class AssistantUiState(
     val limitCompute: Boolean = FossistantApp.limitCompute,
     val mtpEnabled: Boolean = FossistantApp.useMtp,
     val strictToolCalls: Boolean = FossistantApp.strictToolCalls,
+    val gemmaVoiceInput: Boolean = FossistantApp.gemmaVoiceInput,
     /** An imported model the user picked that isn't on the device yet: the UI asks for its file. */
     val modelImportRequest: PrimaryLlmModel? = null,
     /** Progress of a running model import (0..1), or null. */
@@ -153,7 +153,6 @@ data class AssistantUiState(
 class AssistantViewModel(application: Application) : AndroidViewModel(application) {
 
     private val app: FossistantApp = application as FossistantApp
-    private val router: DualModelRouter = app.router
     val sttEngine: WhisperMultilingualSttEngine = app.sttEngine
 
     private val _uiState = MutableStateFlow(
@@ -195,9 +194,45 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
 
         // Language and voice saved by the setup (or a later change in Settings).
         SupportedLanguage.fromCode(FossistantApp.preferredLanguageCode).takeIf { !it.isAuto }?.let { saved ->
-            val voice = FastMultilingualTtsEngine.defaultProfileFor(saved)
-            app.ttsEngine.selectVoiceProfile(voice)
+            val voice = if (app.ttsEngine.activeProfile.value.language == saved) {
+                app.ttsEngine.activeProfile.value
+            } else {
+                FastMultilingualTtsEngine.defaultProfileFor(saved).also { app.ttsEngine.selectVoiceProfile(it) }
+            }
             _uiState.update { it.copy(selectedLanguage = saved, selectedVoiceProfile = voice) }
+        }
+
+        // Keep multi-window ViewModels (MainActivity, AssistOverlayActivity, VoiceInteractionSession) in sync
+        viewModelScope.launch {
+            FossistantApp.settingsRevision.collect {
+                val preferredLang = SupportedLanguage.fromCode(FossistantApp.preferredLanguageCode)
+                _uiState.update { state ->
+                    state.copy(
+                        voiceTriggerEnabled = FossistantApp.isVoiceTriggerEnabled,
+                        wakeWordPhrase = FossistantApp.wakeWordPhrase,
+                        wakeWordSensitivity = FossistantApp.wakeWordSensitivity,
+                        moodTheme = FossistantApp.currentMoodTheme,
+                        aiName = FossistantApp.customAiName,
+                        customPersonalityInstructions = FossistantApp.customPersonalityInstructions,
+                        primaryModelChoice = FossistantApp.primaryModelChoice,
+                        primaryModelDisplayName = FossistantApp.primaryModelChoice.displayName,
+                        whisperModelChoice = FossistantApp.whisperModelChoice,
+                        whisperHardwareBackend = FossistantApp.whisperHardwareBackend,
+                        primaryHardwareBackend = FossistantApp.primaryHardwareBackend,
+                        isLlmOnCpu = app.gemmaEngine.activeBackendName.contains("CPU", ignoreCase = true) ||
+                            FossistantApp.primaryHardwareBackend == HardwareInferenceBackend.CPU,
+                        isVoiceDuplexMode = FossistantApp.isVoiceDuplexMode,
+                        limitCompute = FossistantApp.limitCompute,
+                        mtpEnabled = FossistantApp.useMtp,
+                        strictToolCalls = FossistantApp.strictToolCalls,
+                        gemmaVoiceInput = FossistantApp.gemmaVoiceInput,
+                        showOnboarding = !FossistantApp.isOnboardingCompleted,
+                        downloadOverWifiOnly = FossistantApp.downloadOverWifiOnly,
+                        selectedLanguage = if (!preferredLang.isAuto) preferredLang else state.selectedLanguage,
+                        selectedVoiceProfile = app.ttsEngine.activeProfile.value
+                    )
+                }
+            }
         }
 
         // Model downloads for APKs without bundled models (slim).
@@ -266,7 +301,20 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // Saved chats are shared with the other screen's view model and persisted on disk
         viewModelScope.launch {
             app.chatHistoryStore.sessions.collect { sessions ->
-                _uiState.update { it.copy(previousChats = sessions) }
+                _uiState.update { state ->
+                    val matchingSession = sessions.firstOrNull { it.id == state.currentChatSessionId }
+                    val shouldSyncActiveMessages = !state.isGenerating &&
+                        !state.isReasoning &&
+                        !state.isTemporaryChat &&
+                        matchingSession != null &&
+                        (matchingSession.messages.size > state.messages.size ||
+                            (matchingSession.messages.size == state.messages.size &&
+                                matchingSession.messages.map { it.id to it.text } != state.messages.map { it.id to it.text }))
+                    state.copy(
+                        previousChats = sessions,
+                        messages = if (shouldSyncActiveMessages) matchingSession!!.messages else state.messages
+                    )
+                }
             }
         }
         // Observe persistent AI memory facts
@@ -348,14 +396,21 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         // Poll background wake-word mic RMS for the Settings Wake Word test meter
         viewModelScope.launch {
             while (isActive) {
-                val bgRms = maxOf(
-                    WhisperMultilingualSttEngine.latestBackgroundMicRmsDb,
-                    sttEngine.currentRmsDb.value
-                )
-                if (_uiState.value.backgroundMicRmsDb != bgRms) {
-                    _uiState.update { it.copy(backgroundMicRmsDb = bgRms) }
+                if (FossistantApp.isVoiceTriggerEnabled || sttEngine.isListening.value) {
+                    val bgRms = maxOf(
+                        WhisperMultilingualSttEngine.latestBackgroundMicRmsDb,
+                        sttEngine.currentRmsDb.value
+                    )
+                    if (_uiState.value.backgroundMicRmsDb != bgRms) {
+                        _uiState.update { it.copy(backgroundMicRmsDb = bgRms) }
+                    }
+                    delay(200)
+                } else {
+                    if (_uiState.value.backgroundMicRmsDb != 0f) {
+                        _uiState.update { it.copy(backgroundMicRmsDb = 0f) }
+                    }
+                    delay(1000)
                 }
-                delay(140)
             }
         }
         // Propagate state & audio levels to floating agent blob during Agent Mode
@@ -970,24 +1025,103 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    fun hasAssistScreenshot(): Boolean {
+        val jpeg = FossistantApp.lastCapturedScreenshotJpeg ?: return false
+        return jpeg.isNotEmpty() &&
+            System.currentTimeMillis() - FossistantApp.lastCapturedScreenshotAtMs < SCREENSHOT_MAX_AGE_MS
+    }
+
+    fun canUseCircleToSearch(): Boolean =
+        hasAssistScreenshot() || FossistantAgentAccessibilityService.activeInstance != null
+
+    /**
+     * Supplies a fresh screenshot JPEG for Circle to Search: uses the recent assist screenshot if
+     * available, otherwise waits briefly for overlay UI to hide and captures via Accessibility.
+     */
+    fun ensureScreenshotForCircleToSearch(onResult: (ByteArray?) -> Unit) {
+        val existing = FossistantApp.lastCapturedScreenshotJpeg
+        if (existing != null && hasAssistScreenshot()) {
+            onResult(existing)
+            return
+        }
+        val service = FossistantAgentAccessibilityService.activeInstance
+        if (service == null) {
+            onResult(null)
+            return
+        }
+        viewModelScope.launch {
+            val captured = try {
+                delay(180L)
+                service.captureScreenshotJpeg(maxDimension = 1280)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                org.fossistant.assistant.util.AppLogger.w("AssistantViewModel", "Circle to Search screenshot capture failed", t)
+                null
+            }
+            if (captured != null) {
+                FossistantApp.lastCapturedScreenshotJpeg = captured
+                FossistantApp.lastCapturedScreenshotAtMs = System.currentTimeMillis()
+            }
+            onResult(captured)
+        }
+    }
+
+    /**
+     * Attaches a cropped Circle to Search JPEG region to the next prompt without attaching the
+     * full screenshot or unrelated screen-wide text dump.
+     */
+    suspend fun attachCroppedScreenshotRegionAsync(croppedJpeg: ByteArray): Boolean {
+        if (croppedJpeg.isEmpty()) return false
+        val imageAttachment = writeCachedScreenAttachmentAsync(
+            jpeg = croppedJpeg,
+            filePrefix = "circle_search_",
+            displayName = "Circled_Screen_Region.jpg"
+        )
+        _uiState.update { state ->
+            state.copy(
+                pendingAttachments = state.pendingAttachments.filterNot {
+                    it.id == "assist_screenshot" || it.id == "screen_context_live"
+                } + imageAttachment
+            )
+        }
+        return true
+    }
+
+    private suspend fun writeCachedScreenAttachmentAsync(
+        jpeg: ByteArray,
+        filePrefix: String,
+        displayName: String
+    ): MediaAttachment {
+        val ctx = getApplication<Application>()
+        val file = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val target = File(ctx.cacheDir, "$filePrefix${System.currentTimeMillis()}.jpg").apply { writeBytes(jpeg) }
+            runCatching {
+                ctx.cacheDir.listFiles { f -> f.name.startsWith(filePrefix) && f != target }?.forEach { it.delete() }
+            }
+            target
+        }
+        return MediaAttachment(
+            id = "assist_screenshot",
+            uriString = file.absolutePath,
+            fileName = displayName,
+            modality = MediaModality.IMAGE,
+            mimeType = "image/jpeg",
+            sizeBytes = jpeg.size.toLong()
+        )
+    }
+
     /**
      * Attaches the screenshot Android took when the assistant was opened over another app (needs "Use
      * screenshot" in the default assistant settings), plus the screen text. Returns false if none is available.
      */
-    fun attachAssistScreenshot(): Boolean {
+    suspend fun attachAssistScreenshotAsync(): Boolean {
         val jpeg = FossistantApp.lastCapturedScreenshotJpeg
-        val fresh = System.currentTimeMillis() - FossistantApp.lastCapturedScreenshotAtMs < SCREENSHOT_MAX_AGE_MS
-        if (jpeg == null || !fresh) return false
-        val ctx = getApplication<Application>()
-        val file = File(ctx.cacheDir, "assist_screen_${System.currentTimeMillis()}.jpg").apply { writeBytes(jpeg) }
-        ctx.cacheDir.listFiles { f -> f.name.startsWith("assist_screen_") && f != file }?.forEach { it.delete() }
-        val imageAttachment = MediaAttachment(
-            id = "assist_screenshot",
-            uriString = file.absolutePath,
-            fileName = "Screen",
-            modality = MediaModality.IMAGE,
-            mimeType = "image/jpeg",
-            sizeBytes = jpeg.size.toLong()
+        if (jpeg == null || !hasAssistScreenshot()) return false
+        val imageAttachment = writeCachedScreenAttachmentAsync(
+            jpeg = jpeg,
+            filePrefix = "assist_screen_",
+            displayName = "Screen"
         )
         val screenText = FossistantApp.lastCapturedScreenContext?.takeIf { it.isNotBlank() }
         val textAttachment = screenText?.let { dump ->
@@ -1049,6 +1183,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                 }
                 app.gemmaEngine.recordExternalTurn(userMessage.text, _uiState.value.messages.lastOrNull { it.id == answerId }?.text.orEmpty())
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                org.fossistant.assistant.util.AppLogger.e("AssistantViewModel", "Deep research failed", t)
+                _uiState.update { it.copy(errorMessage = "Deep research failed: ${t.message}") }
             } finally {
                 _uiState.update { it.copy(isReasoning = false, isGenerating = false) }
                 saveCurrentChatSession(_uiState.value.currentChatSessionId, _uiState.value.messages)
@@ -1116,7 +1255,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         stayInVoiceMode: Boolean = false,
         forceSpeakResponse: Boolean = false
     ) {
-        val prompt = rawPrompt.trim()
+        // Experimental Gemma voice input: the "prompt" is a recording, sent to Gemma as audio with no words.
+        val voiceClipPath = WhisperMultilingualSttEngine.voiceAudioPath(rawPrompt)
+        val voiceClip = voiceClipPath?.let { File(it) }?.takeIf { it.exists() }
+        if (voiceClipPath != null && voiceClip == null) return
+        val prompt = if (voiceClip != null) "" else rawPrompt.trim()
         val stateSnapshot = _uiState.value
         if (stateSnapshot.isResearchArmed && prompt.isNotEmpty() && stateSnapshot.screenMode != AppScreenMode.VOICE_MODE) {
             _uiState.update { it.copy(isResearchArmed = false) }
@@ -1135,19 +1278,25 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 return
             }
         }
-        // The live camera keeps overwriting one frame file; each question keeps its own copy so the chat shows
-        // the frame that was actually asked about.
-        val attachments = stateSnapshot.pendingAttachments.map { attachment ->
-            if (attachment.id == LIVE_CAMERA_ATTACHMENT_ID) snapshotLiveFrame(attachment) else attachment
-        }
-        if (prompt.isEmpty() && attachments.isEmpty()) return
+        val rawAttachments = stateSnapshot.pendingAttachments + listOfNotNull(voiceClip?.let {
+            MediaAttachment(
+                id = UUID.randomUUID().toString(),
+                uriString = it.absolutePath,
+                fileName = "Voice message",
+                modality = MediaModality.AUDIO,
+                mimeType = "audio/wav",
+                sizeBytes = it.length()
+            )
+        })
+        if (prompt.isEmpty() && rawAttachments.isEmpty()) return
 
         val enableReasoning = stateSnapshot.isReasoningToggleEnabled
+        val userMessageId = UUID.randomUUID().toString()
         val userMessage = ChatMessage(
-            id = UUID.randomUUID().toString(),
+            id = userMessageId,
             isUser = true,
-            text = prompt.ifEmpty { "[Attached ${attachments.size} file(s)]" },
-            attachments = attachments
+            text = if (voiceClip != null) "(Voice message)" else prompt.ifEmpty { "[Attached ${rawAttachments.size} file(s)]" },
+            attachments = rawAttachments
         )
 
         // Keep live camera frame attachment if Live Camera Viewfinder is still active
@@ -1181,28 +1330,79 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         val isVoiceSession = stayInVoiceMode || stateSnapshot.screenMode == AppScreenMode.VOICE_MODE || forceSpeakResponse
         app.gemmaEngine.isVoiceMode = isVoiceSession
 
-        activeGenerationJob?.cancel()
+        // A turn whose answer is already shown may still be finishing Gemma's hidden second pass (at most a few
+        // seconds): let it end and start after it, since cancelling LiteRT mid-pass leaves a stale cancel behind.
+        val previousTurn = activeGenerationJob
+        val previousTurnAnswered = app.gemmaEngine.isFinishingAnsweredTurn
+        if (!previousTurnAnswered) {
+            previousTurn?.cancel()
+            app.gemmaEngine.cancelCurrentGeneration()
+        }
         app.ttsEngine.stop()
-        app.gemmaEngine.cancelCurrentGeneration()
         activeGenerationJob = viewModelScope.launch {
+            if (previousTurnAnswered) previousTurn?.join()
             try {
-                // Language the answer is spoken in: the chosen language, or in Automatic mode the language
-                // Whisper heard (voice) or the on-device language identifier finds in the typed prompt.
-                val replyLanguageTag: String? = when {
+                // The live camera keeps overwriting one frame file; snapshot off the Main thread so each
+                // question keeps its own frame copy without blocking UI rendering or prefill start.
+                val attachments = if (rawAttachments.any { it.id == LIVE_CAMERA_ATTACHMENT_ID }) {
+                    val snapshotted = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        rawAttachments.map { attachment ->
+                            if (attachment.id == LIVE_CAMERA_ATTACHMENT_ID) snapshotLiveFrame(attachment) else attachment
+                        }
+                    }
+                    _uiState.update { state ->
+                        val idx = state.messages.indexOfFirst { it.id == userMessageId }
+                        if (idx >= 0) {
+                            val updated = state.messages.toMutableList()
+                            updated[idx] = updated[idx].copy(attachments = snapshotted)
+                            state.copy(messages = updated)
+                        } else {
+                            state
+                        }
+                    }
+                    snapshotted
+                } else {
+                    rawAttachments
+                }
+
+                val shouldSpeak = isVoiceSession && stateSnapshot.voiceProfilesEnabled && stateSnapshot.soundNotificationsEnabled
+                // Language the answer is spoken in: skipped entirely in text chat; when needed for speech,
+                // TextClassifier runs in parallel with LLM prefill instead of delaying prompt submission.
+                var resolvedReplyLanguage: String? = when {
+                    !shouldSpeak -> null
                     !stateSnapshot.selectedLanguage.isAuto -> stateSnapshot.selectedLanguage.code
+                    // No transcript to detect the language from: keep the voice's current language.
+                    voiceClip != null -> null
                     isVoiceSession && sttEngine.lastDetectedLanguage.value != null ->
                         SupportedLanguage.fromCode(sttEngine.lastDetectedLanguage.value).code
-                    else -> detectTextLanguageTag(prompt)
+                    else -> null
                 }
-                val shouldSpeak = isVoiceSession && stateSnapshot.voiceProfilesEnabled && stateSnapshot.soundNotificationsEnabled
+                val needsTextLanguageId = shouldSpeak &&
+                    stateSnapshot.selectedLanguage.isAuto &&
+                    voiceClip == null &&
+                    resolvedReplyLanguage == null &&
+                    prompt.isNotBlank()
+                val replyLanguageDeferred = if (needsTextLanguageId) {
+                    async(kotlinx.coroutines.Dispatchers.Default) { detectTextLanguageTag(prompt) }
+                } else {
+                    null
+                }
+                var languageResolved = !needsTextLanguageId
+                suspend fun resolveReplyLanguage(): String? {
+                    if (!languageResolved) {
+                        resolvedReplyLanguage = replyLanguageDeferred?.await()
+                        languageResolved = true
+                    }
+                    return resolvedReplyLanguage
+                }
+
                 var spokenCharCount = 0
                 var spokenText = ""
                 var isFirstTtsChunk = true
-                val sentenceRegex = Regex("(?<=[.!?\\n])\\s+")
 
                 val turnContext = app.features.turnContext(prompt, stateSnapshot.activeProjectId)
-                router.processUserTurn(
-                    prompt = prompt.ifEmpty { "Describe what you see in the attached image or context." },
+                app.gemmaEngine.processUserTurn(
+                    prompt = if (voiceClip != null) "" else prompt.ifEmpty { "Describe what you see in the attached image or context." },
                     attachments = attachments,
                     enableReasoning = enableReasoning,
                     turnContext = turnContext
@@ -1234,19 +1434,44 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     }
                     if (shouldSpeak && !assistantMsg.isReasoningPhase && assistantMsg.text.length > spokenCharCount) {
                         var unhandled = assistantMsg.text.substring(spokenCharCount)
-                        var match = sentenceRegex.find(unhandled)
+                        var match = SENTENCE_SPLIT_REGEX.find(unhandled)
                         while (match != null) {
                             val endIdx = match.range.last + 1
                             val clause = unhandled.substring(0, match.range.first + 1).trim()
                             if (clause.isNotEmpty()) {
-                                app.ttsEngine.speakFast(clause, flushQueue = isFirstTtsChunk, languageTag = replyLanguageTag)
+                                app.ttsEngine.speakFast(clause, flushQueue = isFirstTtsChunk, languageTag = resolveReplyLanguage())
                                 isFirstTtsChunk = false
                             }
                             spokenCharCount += endIdx
                             spokenText = assistantMsg.text.substring(0, spokenCharCount)
                             unhandled = assistantMsg.text.substring(spokenCharCount)
-                            match = sentenceRegex.find(unhandled)
+                            match = SENTENCE_SPLIT_REGEX.find(unhandled)
                         }
+                        // Lower time-to-first-audio: flush the first chunk early on a natural clause boundary.
+                        if (isFirstTtsChunk && unhandled.length >= FIRST_CLAUSE_MIN_CHARS) {
+                            val clauseMatch = FIRST_CLAUSE_SPLIT_REGEX.find(unhandled)
+                            if (clauseMatch != null && clauseMatch.range.first >= FIRST_CLAUSE_MIN_BREAK_INDEX) {
+                                val endIdx = clauseMatch.range.last + 1
+                                val clause = unhandled.substring(0, clauseMatch.range.first + 1).trim()
+                                if (clause.isNotEmpty()) {
+                                    app.ttsEngine.speakFast(clause, flushQueue = true, languageTag = resolveReplyLanguage())
+                                    isFirstTtsChunk = false
+                                    spokenCharCount += endIdx
+                                    spokenText = assistantMsg.text.substring(0, spokenCharCount)
+                                }
+                            }
+                        }
+                    }
+                    // The answer is final (an action's own reply can arrive before Gemma's hidden second pass
+                    // ends): speak the rest now instead of after the stream closes.
+                    if (shouldSpeak && !assistantMsg.isStreaming && !assistantMsg.isReasoningPhase && assistantMsg.text.length > spokenCharCount) {
+                        val remaining = assistantMsg.text.substring(spokenCharCount).trim()
+                        if (remaining.isNotEmpty()) {
+                            app.ttsEngine.speakFast(remaining, flushQueue = isFirstTtsChunk, languageTag = resolveReplyLanguage())
+                            isFirstTtsChunk = false
+                        }
+                        spokenCharCount = assistantMsg.text.length
+                        spokenText = assistantMsg.text
                     }
                 }
 
@@ -1259,7 +1484,7 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                     if (finalAssistantMsg.length > spokenCharCount) {
                         val remaining = finalAssistantMsg.substring(spokenCharCount).trim()
                         if (remaining.isNotEmpty()) {
-                            app.ttsEngine.speakFast(remaining, flushQueue = isFirstTtsChunk, languageTag = replyLanguageTag)
+                            app.ttsEngine.speakFast(remaining, flushQueue = isFirstTtsChunk, languageTag = resolveReplyLanguage())
                         }
                     }
                 }
@@ -1277,6 +1502,11 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                         )
                     }
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                org.fossistant.assistant.util.AppLogger.e("AssistantViewModel", "sendPrompt failed", t)
+                _uiState.update { it.copy(errorMessage = "Generation error: ${t.message}") }
             } finally {
                 // Ensure reasoning and generating flags are ALWAYS cleanly cleared when generation concludes or cancels
                 _uiState.update {
@@ -1301,6 +1531,17 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         if (enabled) {
             releaseGemmaFromRamNow()
         }
+    }
+
+    /** Experimental: voice prompts go to Gemma as recordings, and Whisper is unloaded. */
+    fun setGemmaVoiceInput(enabled: Boolean) {
+        FossistantApp.gemmaVoiceInput = enabled
+        FossistantApp.savePreferences(getApplication())
+        app.gemmaEngine.nativeVoiceInput = enabled
+        sttEngine.audioToGemma = enabled
+        if (enabled) viewModelScope.launch { sttEngine.releaseWhisper() }
+        _uiState.update { it.copy(gemmaVoiceInput = enabled) }
+        org.fossistant.assistant.util.AppLogger.i("AssistantViewModel", "Gemma voice input switched ${if (enabled) "on" else "off"} by the user")
     }
 
     fun setStrictToolCalls(enabled: Boolean) {
@@ -1375,9 +1616,16 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /** Pre-loads Gemma's vision encoder in the background when the user opens a visual flow. */
+    fun prewarmVisionEngine() {
+        app.gemmaEngine.prewarmVisionAsync()
+    }
+
     fun toggleLiveCamera(active: Boolean? = null) {
+        var becameActive = false
         _uiState.update { state ->
             val next = active ?: !state.isLiveCameraActive
+            becameActive = next && !state.isLiveCameraActive
             val updatedAttachments = if (!next) {
                 state.pendingAttachments.filterNot { it.id == LIVE_CAMERA_ATTACHMENT_ID }
             } else {
@@ -1387,6 +1635,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 isLiveCameraActive = next,
                 pendingAttachments = updatedAttachments
             )
+        }
+        if (becameActive) {
+            prewarmVisionEngine()
         }
     }
 
@@ -1406,23 +1657,37 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         }.getOrDefault(attachment)
     }
 
+    private val liveCameraFrameMutex = kotlinx.coroutines.sync.Mutex()
+
     fun updateLiveCameraFrameJpeg(jpegBytes: ByteArray) {
         if (jpegBytes.isEmpty()) return
         val ctx = getApplication<Application>()
-        runCatching {
-            val frameFile = File(ctx.cacheDir, "live_camera_frame.jpg")
-            frameFile.writeBytes(jpegBytes)
-            val liveAttachment = MediaAttachment(
-                id = LIVE_CAMERA_ATTACHMENT_ID,
-                uriString = Uri.fromFile(frameFile).toString(),
-                fileName = "Live_Camera_Stream.jpg",
-                modality = MediaModality.IMAGE,
-                mimeType = "image/jpeg",
-                sizeBytes = jpegBytes.size.toLong()
-            )
-            _uiState.update { state ->
-                val withoutOld = state.pendingAttachments.filterNot { it.id == LIVE_CAMERA_ATTACHMENT_ID }
-                state.copy(pendingAttachments = withoutOld + liveAttachment)
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            liveCameraFrameMutex.lock()
+            try {
+                runCatching {
+                    val frameFile = File(ctx.cacheDir, "live_camera_frame.jpg")
+                    val tempFile = File(ctx.cacheDir, "live_camera_frame.jpg.tmp")
+                    tempFile.writeBytes(jpegBytes)
+                    if (!tempFile.renameTo(frameFile)) {
+                        tempFile.copyTo(frameFile, overwrite = true)
+                        tempFile.delete()
+                    }
+                    val liveAttachment = MediaAttachment(
+                        id = LIVE_CAMERA_ATTACHMENT_ID,
+                        uriString = Uri.fromFile(frameFile).toString(),
+                        fileName = "Live_Camera_Stream.jpg",
+                        modality = MediaModality.IMAGE,
+                        mimeType = "image/jpeg",
+                        sizeBytes = jpegBytes.size.toLong()
+                    )
+                    _uiState.update { state ->
+                        val withoutOld = state.pendingAttachments.filterNot { it.id == LIVE_CAMERA_ATTACHMENT_ID }
+                        state.copy(pendingAttachments = withoutOld + liveAttachment)
+                    }
+                }
+            } finally {
+                liveCameraFrameMutex.unlock()
             }
         }
     }
@@ -1463,6 +1728,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             (mime == "application/pdf" || lower.endsWith(".pdf") || lower.endsWith(".docx") || mime.contains("wordprocessingml"))
         if (!needsExtraction) {
             _uiState.update { it.copy(pendingAttachments = it.pendingAttachments + attachment) }
+            if (modality == MediaModality.IMAGE || modality == MediaModality.VIDEO) {
+                prewarmVisionEngine()
+            }
             return
         }
         // PDFs and Word files are binary: read their text once (same reader as project files).
@@ -1530,6 +1798,58 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
                 screenMode = if (listening && enterVoiceScreenMode) AppScreenMode.VOICE_MODE else it.screenMode
             )
         }
+    }
+
+    /**
+     * Unified voice dictation & hands-free turn-taking starter used by MainActivity,
+     * AssistOverlayActivity, and FossistantVoiceInteractionSession.
+     */
+    fun startVoiceCapture(
+        scope: kotlinx.coroutines.CoroutineScope = viewModelScope,
+        language: SupportedLanguage = _uiState.value.selectedLanguage,
+        continuous: Boolean = FossistantApp.isVoiceDuplexMode,
+        enterVoiceScreenMode: Boolean = true,
+        initialPromptLabel: String = if (enterVoiceScreenMode) {
+            "Listening with Whisper (${language.displayName})..."
+        } else {
+            "Listening with Whisper..."
+        }
+    ) {
+        setVoiceListeningState(
+            listening = true,
+            partialText = initialPromptLabel,
+            enterVoiceScreenMode = enterVoiceScreenMode
+        )
+        sttEngine.startListening(
+            scope = scope,
+            language = language,
+            continuous = continuous,
+            onPartial = { partial ->
+                setVoiceListeningState(
+                    listening = true,
+                    partialText = partial,
+                    enterVoiceScreenMode = enterVoiceScreenMode
+                )
+            },
+            onError = { error ->
+                org.fossistant.assistant.util.AppLogger.w("AssistantViewModel", "Listening stopped: $error")
+                setVoiceListeningState(false, enterVoiceScreenMode = enterVoiceScreenMode)
+            },
+            onFinalResult = { transcript ->
+                if (transcript.isNotBlank()) {
+                    if (!continuous) {
+                        sttEngine.stopListening()
+                    }
+                    sendPrompt(
+                        rawPrompt = transcript,
+                        stayInVoiceMode = true,
+                        forceSpeakResponse = true
+                    )
+                } else if (!continuous) {
+                    setVoiceListeningState(false, enterVoiceScreenMode = enterVoiceScreenMode)
+                }
+            }
+        )
     }
 
     fun updateVoiceRms(rmsDb: Float) {
@@ -1607,9 +1927,15 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             whisper = FossistantApp.whisperModelChoice,
             wifiOnly = FossistantApp.downloadOverWifiOnly
         ) {
-            // Loads the downloaded model once so LiteRT builds this phone's GPU programs now, not on the first question.
-            app.gemmaEngine.ensureInitialized()
-            app.sttEngine.switchModel(FossistantApp.whisperModelChoice)
+            // Load both engines in parallel so LiteRT builds this phone's GPU programs now, not on the first question.
+            kotlinx.coroutines.coroutineScope {
+                launch { app.gemmaEngine.ensureInitialized() }
+                launch {
+                    if (!FossistantApp.gemmaVoiceInput) {
+                        app.sttEngine.switchModel(FossistantApp.whisperModelChoice)
+                    }
+                }
+            }
         }
     }
 
@@ -1647,20 +1973,28 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
             )
         }
         viewModelScope.launch {
-            val success = app.gemmaEngine.switchModel(model)
-            val isLoaded = app.gemmaEngine.isNativeModelLoaded
-            val memStatus = app.gemmaEngine.memoryStatus.value
-            val err = if (!success) app.gemmaEngine.lastEngineError else null
-
-            _uiState.update {
-                it.copy(
-                    primaryModelChoice = model,
-                    primaryModelDisplayName = model.displayName,
-                    isGemmaLoadingMemory = false,
-                    gemmaMemoryStatus = memStatus,
-                    isGemmaLoadedInRam = isLoaded,
-                    errorMessage = err
-                )
+            var err: String? = null
+            try {
+                val success = app.gemmaEngine.switchModel(model)
+                if (!success) err = app.gemmaEngine.lastEngineError
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                org.fossistant.assistant.util.AppLogger.e("AssistantViewModel", "Model switch failed for ${model.displayName}", t)
+                err = "Couldn't switch to ${model.displayName}: ${t.message}"
+            } finally {
+                val isLoaded = app.gemmaEngine.isNativeModelLoaded
+                val memStatus = app.gemmaEngine.memoryStatus.value
+                _uiState.update {
+                    it.copy(
+                        primaryModelChoice = model,
+                        primaryModelDisplayName = model.displayName,
+                        isGemmaLoadingMemory = false,
+                        gemmaMemoryStatus = memStatus,
+                        isGemmaLoadedInRam = isLoaded,
+                        errorMessage = err ?: it.errorMessage
+                    )
+                }
             }
         }
     }
@@ -1685,5 +2019,9 @@ class AssistantViewModel(application: Application) : AndroidViewModel(applicatio
         private const val SCREENSHOT_MAX_AGE_MS = 10 * 60 * 1000L
         /** "deep research: …" or "research: …" starts Deep Research instead of a normal answer. */
         val DEEP_RESEARCH_PREFIX = Regex("^(?i)(deep research|research)\\s*[:\\-]\\s*")
+        private val SENTENCE_SPLIT_REGEX = Regex("(?<=[.!?\\n])\\s+")
+        private val FIRST_CLAUSE_SPLIT_REGEX = Regex("(?<=[,;:—–])\\s+")
+        private const val FIRST_CLAUSE_MIN_CHARS = 36
+        private const val FIRST_CLAUSE_MIN_BREAK_INDEX = 12
     }
 }

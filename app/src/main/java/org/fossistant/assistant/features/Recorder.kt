@@ -20,6 +20,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -83,34 +85,25 @@ class RecordingService : Service() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun record() {
+    private suspend fun record() {
         val app = FossistantApp.instance ?: return
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             stopSelf()
             return
         }
+        // Advertise recording immediately so VoiceWakeWordService yields the hardware microphone.
+        _state.value = State(isRecording = true)
         val dir = File(filesDir, "recordings").apply { mkdirs() }
         val startMs = System.currentTimeMillis()
         val file = File(dir, "rec_$startMs.wav")
         val minBuffer = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val bufferSize = maxOf(minBuffer, SAMPLE_RATE)
-        var recorder = runCatching {
-            AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION, SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize
-            )
-        }.getOrNull()
-        if (recorder == null || recorder.state != AudioRecord.STATE_INITIALIZED) {
-            runCatching { recorder?.release() }
-            recorder = runCatching {
-                AudioRecord(
-                    MediaRecorder.AudioSource.MIC, SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize
-                )
-            }.getOrNull()
+        var recorder = openAudioRecord(bufferSize)
+        if (recorder == null) {
+            delay(220)
+            recorder = openAudioRecord(bufferSize)
         }
-        if (recorder == null || recorder.state != AudioRecord.STATE_INITIALIZED) {
-            runCatching { recorder?.release() }
+        if (recorder == null) {
             _state.value = State()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -119,7 +112,6 @@ class RecordingService : Service() {
         val buffer = ShortArray(SAMPLE_RATE / 10)
         val bytes = ByteBuffer.allocate(buffer.size * 2).order(ByteOrder.LITTLE_ENDIAN)
         var dataBytes = 0L
-        _state.value = State(isRecording = true)
         RandomAccessFile(file, "rw").use { out ->
             out.setLength(0)
             out.write(ByteArray(WAV_HEADER_BYTES))
@@ -167,8 +159,22 @@ class RecordingService : Service() {
         app.features.processRecording(recording.id)
     }
 
+    @SuppressLint("MissingPermission")
+    private fun openAudioRecord(bufferSize: Int): AudioRecord? {
+        for (source in intArrayOf(MediaRecorder.AudioSource.VOICE_RECOGNITION, MediaRecorder.AudioSource.MIC)) {
+            val candidate = runCatching {
+                AudioRecord(source, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize)
+            }.getOrNull()
+            if (candidate != null && candidate.state == AudioRecord.STATE_INITIALIZED) return candidate
+            runCatching { candidate?.release() }
+        }
+        return null
+    }
+
     override fun onDestroy() {
         job?.cancel()
+        scope.cancel()
+        _state.value = State()
         super.onDestroy()
     }
 
@@ -187,7 +193,9 @@ class RecordingService : Service() {
         }
 
         fun stop(context: Context) {
-            context.startService(Intent(context, RecordingService::class.java).setAction(ACTION_STOP))
+            runCatching {
+                context.startService(Intent(context, RecordingService::class.java).setAction(ACTION_STOP))
+            }
         }
 
         private fun writeWavHeader(out: RandomAccessFile, dataBytes: Long) {

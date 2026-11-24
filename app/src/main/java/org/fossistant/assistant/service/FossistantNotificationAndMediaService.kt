@@ -37,9 +37,20 @@ class FossistantNotificationAndMediaService : NotificationListenerService() {
         val remoteInputs: List<RemoteInput>
     )
 
+    data class CachedNotification(
+        val key: String,
+        val packageName: String,
+        val appLabel: String,
+        val title: String,
+        val messageText: String,
+        val timestampMs: Long,
+        val hasDirectReply: Boolean
+    )
+
     override fun onListenerConnected() {
         super.onListenerConnected()
         activeInstance = this
+        runCatching { activeNotifications?.forEach { recordNotification(it) } }
         VoiceWakeWordService.startIfEnabled(applicationContext)
     }
 
@@ -48,42 +59,78 @@ class FossistantNotificationAndMediaService : NotificationListenerService() {
             activeInstance = null
         }
         replyableNotifications.clear()
+        recentNotifications.clear()
         super.onListenerDisconnected()
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        recordNotification(sbn)
+    }
+
+    private fun recordNotification(sbn: StatusBarNotification?) {
         val notification = sbn?.notification ?: return
+        if (sbn.packageName == packageName) return
+        if ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
         val extras = notification.extras ?: return
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
+            ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString()?.trim().orEmpty()
         if (title.isEmpty() && text.isEmpty()) return
 
-        val actions = notification.actions ?: return
+        val actions = notification.actions.orEmpty()
+        var replyAction: Pair<Notification.Action, List<RemoteInput>>? = null
         for (action in actions) {
             val remoteInputs = action.remoteInputs
             if (!remoteInputs.isNullOrEmpty()) {
-                val now = System.currentTimeMillis()
-                replyableNotifications.entries.removeIf { now - it.value.timestampMs > MAX_NOTIFICATION_AGE_MS }
-                replyableNotifications[sbn.key] = ReplyableNotification(
-                    key = sbn.key,
-                    packageName = sbn.packageName,
-                    senderTitle = title,
-                    messageText = text,
-                    timestampMs = sbn.postTime,
-                    action = action,
-                    remoteInputs = remoteInputs.toList()
-                )
-                while (replyableNotifications.size > MAX_CACHED_NOTIFICATIONS) {
-                    val oldestKey = replyableNotifications.values.minByOrNull { it.timestampMs }?.key ?: break
-                    replyableNotifications.remove(oldestKey)
-                }
+                replyAction = action to remoteInputs.toList()
                 break
+            }
+        }
+
+        val now = System.currentTimeMillis()
+        recentNotifications.entries.removeIf { now - it.value.timestampMs > MAX_NOTIFICATION_AGE_MS }
+        replyableNotifications.entries.removeIf { now - it.value.timestampMs > MAX_NOTIFICATION_AGE_MS }
+
+        val appLabel = runCatching {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString()
+        }.getOrDefault(sbn.packageName.substringAfterLast('.'))
+
+        recentNotifications[sbn.key] = CachedNotification(
+            key = sbn.key,
+            packageName = sbn.packageName,
+            appLabel = appLabel,
+            title = title.ifBlank { appLabel },
+            messageText = text.take(240),
+            timestampMs = sbn.postTime,
+            hasDirectReply = replyAction != null
+        )
+        while (recentNotifications.size > MAX_CACHED_NOTIFICATIONS) {
+            val oldestKey = recentNotifications.values.minByOrNull { it.timestampMs }?.key ?: break
+            recentNotifications.remove(oldestKey)
+        }
+
+        if (replyAction != null) {
+            replyableNotifications[sbn.key] = ReplyableNotification(
+                key = sbn.key,
+                packageName = sbn.packageName,
+                senderTitle = title,
+                messageText = text,
+                timestampMs = sbn.postTime,
+                action = replyAction.first,
+                remoteInputs = replyAction.second
+            )
+            while (replyableNotifications.size > MAX_CACHED_NOTIFICATIONS) {
+                val oldestKey = replyableNotifications.values.minByOrNull { it.timestampMs }?.key ?: break
+                replyableNotifications.remove(oldestKey)
             }
         }
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification?) {
-        sbn?.key?.let { replyableNotifications.remove(it) }
+        sbn?.key?.let {
+            replyableNotifications.remove(it)
+            recentNotifications.remove(it)
+        }
     }
 
     override fun onDestroy() {
@@ -125,14 +172,27 @@ class FossistantNotificationAndMediaService : NotificationListenerService() {
     }
 
     /**
-     * Summarizes the latest unread messaging notifications for *"Read my messages"* commands.
+     * Summarizes the latest unread notifications for *"Read my notifications"* and daily briefings.
      */
-    fun getRecentMessagesSummary(limit: Int = 5): String {
-        val recent = replyableNotifications.values
+    fun getRecentMessagesSummary(limit: Int = 8): String {
+        val allRecent = recentNotifications.values
             .sortedByDescending { it.timestampMs }
             .take(limit)
-        if (recent.isEmpty()) return "You have no recent unread messaging notifications."
-        return recent.joinToString("\n") { "• ${it.senderTitle}: ${it.messageText}" }
+        if (allRecent.isNotEmpty()) {
+            return allRecent.joinToString("\n") {
+                val prefix = if (it.appLabel.isNotBlank() && !it.title.equals(it.appLabel, ignoreCase = true)) {
+                    "[${it.appLabel}] ${it.title}"
+                } else {
+                    it.title
+                }
+                "• $prefix: ${it.messageText}"
+            }
+        }
+        val replyable = replyableNotifications.values
+            .sortedByDescending { it.timestampMs }
+            .take(limit)
+        if (replyable.isEmpty()) return "You have no recent unread notifications."
+        return replyable.joinToString("\n") { "• ${it.senderTitle}: ${it.messageText}" }
     }
 
     /**
@@ -236,5 +296,6 @@ class FossistantNotificationAndMediaService : NotificationListenerService() {
             private set
 
         private val replyableNotifications = ConcurrentHashMap<String, ReplyableNotification>()
+        private val recentNotifications = ConcurrentHashMap<String, CachedNotification>()
     }
 }

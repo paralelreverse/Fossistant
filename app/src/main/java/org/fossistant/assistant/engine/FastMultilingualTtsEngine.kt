@@ -28,9 +28,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.sqrt
 
 /**
- * High-speed, low-latency Multilingual TTS Engine supporting **7 Languages**
- * (English, Spanish, French, German, Italian, Japanese, Polish) with **multiple distinct
- * Fast TTS Voice Profiles per language** (21 total profiles) and real-time audio amplitude
+ * High-speed, low-latency Multilingual TTS Engine supporting **26 Voice Profile Languages**
+ * (78 Fast TTS Voice Profiles) and 100 spoken languages, with real-time audio amplitude
  * telemetry ([ttsAudioLevel]) to drive audio-synced [org.fossistant.assistant.ui.components.CosmicAiBlob] animations.
  *
  * Playback architecture (needed for full-duplex barge-in):
@@ -314,6 +313,12 @@ class FastMultilingualTtsEngine(private val context: Context?) {
     @Volatile
     private var playbackThread: Thread? = null
 
+    @Volatile
+    private var captionThread: Thread? = null
+
+    @Volatile
+    private var isShutdown: Boolean = false
+
     private var smoothedLevel = 0f
 
     init {
@@ -417,16 +422,21 @@ class FastMultilingualTtsEngine(private val context: Context?) {
     }
 
     private fun ensurePlaybackThread() {
-        if (playbackThread?.isAlive == true) return
+        if (isShutdown) return
+        if (playbackThread?.isAlive == true && captionThread?.isAlive == true) return
         synchronized(this) {
-            if (playbackThread?.isAlive == true) return
-            playbackThread = Thread({ playbackLoop() }, "FossistantTtsPlayback").apply {
-                isDaemon = true
-                start()
+            if (isShutdown) return
+            if (playbackThread?.isAlive != true) {
+                playbackThread = Thread({ playbackLoop() }, "FossistantTtsPlayback").apply {
+                    isDaemon = true
+                    start()
+                }
             }
-            Thread({ captionClockLoop() }, "FossistantTtsCaptions").apply {
-                isDaemon = true
-                start()
+            if (captionThread?.isAlive != true) {
+                captionThread = Thread({ captionClockLoop() }, "FossistantTtsCaptions").apply {
+                    isDaemon = true
+                    start()
+                }
             }
         }
     }
@@ -435,12 +445,13 @@ class FastMultilingualTtsEngine(private val context: Context?) {
 
     /** Moves [caption]'s spoken position along with the speaker's playback head, ~20 times a second. */
     private fun captionClockLoop() {
-        while (true) {
+        while (!isShutdown && !Thread.currentThread().isInterrupted) {
             try {
                 Thread.sleep(CAPTION_TICK_MS)
             } catch (_: InterruptedException) {
                 return
             }
+            if (isShutdown) return
             if (_isSpeaking.value) runCatching { updateSpokenPosition() }
         }
     }
@@ -830,12 +841,15 @@ class FastMultilingualTtsEngine(private val context: Context?) {
     fun stopSpeaking() = stop()
 
     fun shutdown() {
+        isShutdown = true
         stop()
         try {
             tts?.shutdown()
         } catch (_: Throwable) {}
         playbackThread?.interrupt()
         playbackThread = null
+        captionThread?.interrupt()
+        captionThread = null
         synchronized(audioTrackLock) {
             audioTrack?.let {
                 runCatching { it.stop() }

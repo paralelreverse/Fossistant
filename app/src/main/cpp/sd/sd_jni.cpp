@@ -1,17 +1,17 @@
 #include <jni.h>
 #include <android/log.h>
-#include <atomic>
 #include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include "stable-diffusion.h"
 
 // NOTE: app/src/main/jniLibs/arm64-v8a/libsd_jni.so is prebuilt from this file; after editing it,
 // rebuild with scripts/build-sd-jni.sh (stable-diffusion.cpp + Android NDK).
 //
-// ggml is linked statically with hidden symbols, so it never clashes with llama.cpp's libggml*.so.
+// ggml is linked statically with hidden symbols, so it never clashes with whisper.cpp's ggml symbols.
 
 #define TAG "sd_jni"
 
@@ -20,11 +20,14 @@ namespace {
 struct SdHandle {
     sd_ctx_t* ctx = nullptr;
     bool tiny_vae = false;
+    bool using_gpu = false;
 };
 
 std::mutex g_generate_mutex;
+std::mutex g_state_mutex;
 std::mutex g_log_mutex;
 std::deque<std::string> g_log_lines;
+std::unordered_set<SdHandle*> g_live_handles;
 JavaVM* g_vm = nullptr;
 
 struct ProgressTarget {
@@ -32,7 +35,7 @@ struct ProgressTarget {
     jmethodID on_step = nullptr;
 };
 ProgressTarget g_progress;
-std::atomic<sd_ctx_t*> g_active_ctx{nullptr};
+sd_ctx_t* g_active_ctx = nullptr;
 
 void on_log(sd_log_level_t level, const char* text, void*) {
     if (!text) return;
@@ -75,27 +78,58 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
 
 extern "C" JNIEXPORT jlong JNICALL
 Java_org_fossistant_assistant_engine_ImageGenEngine_nativeLoad(
-    JNIEnv* env, jobject, jstring modelPath, jstring taesdPath, jint nThreads) {
+    JNIEnv* env, jobject, jstring modelPath, jstring taesdPath, jint nThreads, jboolean useGpu) {
     std::string model = to_string(env, modelPath);
     std::string taesd = to_string(env, taesdPath);
     if (model.empty()) return 0L;
 
-    sd_ctx_params_t params;
-    sd_ctx_params_init(&params);
-    params.model_path = model.c_str();
-    params.taesd_path = taesd.empty() ? nullptr : taesd.c_str();
-    params.n_threads = nThreads > 0 ? nThreads : sd_get_num_physical_cores();
-    // Weights stay in the page cache instead of a second copy in the heap.
-    params.enable_mmap = true;
-    // Smaller attention buffers in the UNet: lower peak RAM on 8 GB phones.
-    params.diffusion_flash_attn = true;
+    auto init_params = [&](const char* backend, const char* params_backend) {
+        sd_ctx_params_t params;
+        sd_ctx_params_init(&params);
+        params.model_path = model.c_str();
+        params.taesd_path = taesd.empty() ? nullptr : taesd.c_str();
+        params.n_threads = nThreads > 0 ? nThreads : sd_get_num_physical_cores();
+        // Weights stay in the page cache instead of a second copy in the heap.
+        params.enable_mmap = true;
+        // Smaller attention buffers in the UNet: lower peak RAM on 8 GB phones.
+        params.diffusion_flash_attn = true;
+        params.backend = backend;
+        params.params_backend = params_backend;
+        return params;
+    };
 
-    sd_ctx_t* ctx = new_sd_ctx(&params);
+    bool used_gpu = static_cast<bool>(useGpu);
+    sd_ctx_t* ctx = nullptr;
+    if (used_gpu) {
+        sd_ctx_params_t gpu_params = init_params("gpu", nullptr);
+        ctx = new_sd_ctx(&gpu_params);
+        if (!ctx) {
+            used_gpu = false;
+        }
+    }
+    if (!ctx) {
+        used_gpu = false;
+        sd_ctx_params_t cpu_params = init_params("cpu", "cpu");
+        ctx = new_sd_ctx(&cpu_params);
+    }
     if (!ctx) return 0L;
     auto* handle = new SdHandle();
     handle->ctx = ctx;
     handle->tiny_vae = !taesd.empty();
+    handle->using_gpu = used_gpu;
+    {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        g_live_handles.insert(handle);
+    }
     return reinterpret_cast<jlong>(handle);
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_org_fossistant_assistant_engine_ImageGenEngine_nativeIsUsingGpu(
+    JNIEnv*, jobject, jlong handlePtr) {
+    auto* handle = reinterpret_cast<SdHandle*>(handlePtr);
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    return (handle && g_live_handles.count(handle) != 0 && handle->using_gpu) ? JNI_TRUE : JNI_FALSE;
 }
 
 // Returns width * height * 3 RGB bytes, or null on failure or cancel. initRgb/maskGray are optional
@@ -109,8 +143,16 @@ Java_org_fossistant_assistant_engine_ImageGenEngine_nativeGenerate(
     jbyteArray initRgb, jfloat strength, jbyteArray maskGray,
     jobject listener) {
     auto* handle = reinterpret_cast<SdHandle*>(handlePtr);
-    if (!handle || !handle->ctx) return nullptr;
+    if (!handle) return nullptr;
     std::lock_guard<std::mutex> lock(g_generate_mutex);
+    sd_ctx_t* ctx = nullptr;
+    bool tiny_vae = false;
+    {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        if (g_live_handles.count(handle) == 0 || !handle->ctx) return nullptr;
+        ctx = handle->ctx;
+        tiny_vae = handle->tiny_vae;
+    }
 
     std::string prompt_s = to_string(env, prompt);
     std::string negative_s = to_string(env, negativePrompt);
@@ -132,7 +174,7 @@ Java_org_fossistant_assistant_engine_ImageGenEngine_nativeGenerate(
     if (!sampler_s.empty()) params.sample_params.sample_method = str_to_sample_method(sampler_s.c_str());
     if (!scheduler_s.empty()) params.sample_params.scheduler = str_to_scheduler(scheduler_s.c_str());
     // The full VAE decodes 512x512 in tiles to keep peak RAM down; TAESD is small enough not to need it.
-    params.vae_tiling_params.enabled = !handle->tiny_vae;
+    params.vae_tiling_params.enabled = !tiny_vae;
 
     sd_lora_t lora{};
     if (!lora_s.empty()) {
@@ -163,13 +205,19 @@ Java_org_fossistant_assistant_engine_ImageGenEngine_nativeGenerate(
         g_progress.listener = env->NewGlobalRef(listener);
         env->DeleteLocalRef(cls);
     }
-    sd_cancel_generation(handle->ctx, SD_CANCEL_RESET);
-    g_active_ctx = handle->ctx;
+    sd_cancel_generation(ctx, SD_CANCEL_RESET);
+    {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        g_active_ctx = ctx;
+    }
 
     sd_image_generation_result_t* result = nullptr;
-    bool ok = generate_image(handle->ctx, &params, &result);
+    bool ok = generate_image(ctx, &params, &result);
 
-    g_active_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        g_active_ctx = nullptr;
+    }
     if (g_progress.listener) env->DeleteGlobalRef(g_progress.listener);
     g_progress = {};
 
@@ -188,8 +236,8 @@ Java_org_fossistant_assistant_engine_ImageGenEngine_nativeGenerate(
 
 extern "C" JNIEXPORT void JNICALL
 Java_org_fossistant_assistant_engine_ImageGenEngine_nativeCancel(JNIEnv*, jobject) {
-    sd_ctx_t* ctx = g_active_ctx.load();
-    if (ctx) sd_cancel_generation(ctx, SD_CANCEL_ALL);
+    std::lock_guard<std::mutex> state_lock(g_state_mutex);
+    if (g_active_ctx) sd_cancel_generation(g_active_ctx, SD_CANCEL_ALL);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -197,6 +245,11 @@ Java_org_fossistant_assistant_engine_ImageGenEngine_nativeFree(JNIEnv*, jobject,
     auto* handle = reinterpret_cast<SdHandle*>(handlePtr);
     if (!handle) return;
     std::lock_guard<std::mutex> lock(g_generate_mutex);
+    {
+        std::lock_guard<std::mutex> state_lock(g_state_mutex);
+        if (g_live_handles.erase(handle) == 0) return;
+        if (g_active_ctx == handle->ctx) g_active_ctx = nullptr;
+    }
     if (handle->ctx) free_sd_ctx(handle->ctx);
     delete handle;
 }

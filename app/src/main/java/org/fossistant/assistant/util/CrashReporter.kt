@@ -19,7 +19,7 @@ import java.util.Locale
  * whether to send it. Sending opens the user's own email app with the report filled in (they see all of it
  * and can edit or discard it); nothing leaves the phone otherwise.
  *
- * Catches Kotlin/Java crashes directly and, on Android 11+, also native crashes (LiteRT, llama.cpp,
+ * Catches Kotlin/Java crashes directly and, on Android 11+, also native crashes (LiteRT,
  * whisper.cpp, stable-diffusion.cpp) and freezes ("app not responding") from Android's exit records.
  * The address comes from the build: `-PcrashReportEmail=you@example.com`; without one, Send shares the
  * report through any app.

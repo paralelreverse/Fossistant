@@ -18,23 +18,39 @@ import org.fossistant.assistant.tools.DeviceAndWebToolExecutor
 class Features(
     private val context: Context,
     private val engine: GemmaLiteRtEngine,
-    executor: DeviceAndWebToolExecutor
+    executor: DeviceAndWebToolExecutor,
+    eagerLoad: Boolean = true
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val dir = context.filesDir
 
-    val skills = JsonListStore(dir, "skills.json", Skill.serializer(), { it.id }) { Skill.DEFAULTS }
-    val projects = JsonListStore(dir, "projects.json", Project.serializer(), { it.id })
-    val tasks = JsonListStore(dir, "tasks.json", ScheduledTask.serializer(), { it.id })
-    val recordings = JsonListStore(dir, "recordings.json", Recording.serializer(), { it.id })
+    val skills = JsonListStore(dir, "skills.json", Skill.serializer(), { it.id }, eagerLoad = eagerLoad) { Skill.DEFAULTS }
+    val projects = JsonListStore(dir, "projects.json", Project.serializer(), { it.id }, eagerLoad = eagerLoad)
+    val tasks = JsonListStore(dir, "tasks.json", ScheduledTask.serializer(), { it.id }, eagerLoad = eagerLoad)
+    val recordings = JsonListStore(dir, "recordings.json", Recording.serializer(), { it.id }, eagerLoad = eagerLoad)
     val connectors = ConnectorManager(
-        JsonListStore(dir, "connectors.json", Connector.serializer(), { it.id })
+        JsonListStore(dir, "connectors.json", Connector.serializer(), { it.id }, eagerLoad = eagerLoad)
     ) { summary -> engine.connectorToolsSummary = summary }
     val research = DeepResearch(engine, executor)
 
     private val recordingMutex = Mutex()
 
     init {
+        if (eagerLoad) migrateBuiltInSkills()
+    }
+
+    /** Loads all persisted stores and runs one-time migrations off the Main thread. */
+    fun loadAllStoresAndMigrate() {
+        skills.loadIfNeeded()
+        projects.loadIfNeeded()
+        tasks.loadIfNeeded()
+        recordings.loadIfNeeded()
+        connectors.store.loadIfNeeded()
+        migrateBuiltInSkills()
+        connectors.publishToolSummary()
+    }
+
+    private fun migrateBuiltInSkills() {
         // Skills added in later versions reach people who already have a saved skill list (once).
         val prefs = context.getSharedPreferences("fossistant_prefs", Context.MODE_PRIVATE)
         if (!prefs.getBoolean("skill_pdf_added", false)) {

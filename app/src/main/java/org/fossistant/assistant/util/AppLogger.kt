@@ -2,6 +2,7 @@ package org.fossistant.assistant.util
 
 import android.content.Context
 import android.util.Log
+import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
 import java.io.PrintWriter
@@ -35,7 +36,7 @@ object AppLogger {
     private val lock = ReentrantLock()
     private val buffer = ArrayDeque<String>(MAX_LOG_LINES)
     private var logFile: File? = null
-    private var fileWriter: FileWriter? = null
+    private var fileWriter: BufferedWriter? = null
     private var totalLinesWrittenSinceCompact = 0
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
@@ -56,12 +57,17 @@ object AppLogger {
             try {
                 val dir = File(context.filesDir, LOG_SUBDIR).apply { mkdirs() }
                 logFile = File(dir, LOG_FILENAME)
-                loadPersistedLogsLocked()
-                fileWriter = FileWriter(logFile, true)
-                i("AppLogger", "=== App Session Initialized (Retained ${buffer.size} lines from previous runs) ===")
+                fileWriter = BufferedWriter(FileWriter(logFile, true), 8192)
             } catch (t: Throwable) {
                 Log.e("AppLogger", "Failed to initialize persistent log file", t)
             }
+        }
+        diskWriter.execute {
+            val retainedCount = lock.withLock {
+                loadPersistedLogsLocked()
+                buffer.size
+            }
+            i("AppLogger", "=== App Session Initialized (Retained $retainedCount lines from previous runs) ===")
         }
     }
 
@@ -71,10 +77,18 @@ object AppLogger {
 
         try {
             val lines = file.readLines()
+            val earlyLines = buffer.toList()
             buffer.clear()
-            val startIdx = if (lines.size > MAX_LOG_LINES) lines.size - MAX_LOG_LINES else 0
+            val maxFromFile = (MAX_LOG_LINES - earlyLines.size).coerceAtLeast(0)
+            val startIdx = if (lines.size > maxFromFile) lines.size - maxFromFile else 0
             for (i in startIdx until lines.size) {
                 buffer.addLast(lines[i])
+            }
+            for (early in earlyLines) {
+                if (buffer.size >= MAX_LOG_LINES) {
+                    buffer.removeFirst()
+                }
+                buffer.addLast(early)
             }
             totalLinesWrittenSinceCompact = buffer.size
         } catch (t: Throwable) {
@@ -122,7 +136,9 @@ object AppLogger {
                     try {
                         fileWriter?.let { writer ->
                             writer.write(line + "\n")
-                            writer.flush()
+                            if (level == "E" || level == "W" || throwable != null) {
+                                writer.flush()
+                            }
                         }
                         totalLinesWrittenSinceCompact += splitLines.size
                         if (totalLinesWrittenSinceCompact >= RECOMPACT_THRESHOLD) {
@@ -150,11 +166,11 @@ object AppLogger {
             }
             if (file.exists()) file.delete()
             tempFile.renameTo(file)
-            fileWriter = FileWriter(file, true)
+            fileWriter = BufferedWriter(FileWriter(file, true), 8192)
             totalLinesWrittenSinceCompact = buffer.size
         } catch (t: Throwable) {
             Log.e("AppLogger", "Error re-compacting log file", t)
-            runCatching { fileWriter = FileWriter(file, true) }
+            runCatching { fileWriter = BufferedWriter(FileWriter(file, true), 8192) }
         }
     }
 
@@ -243,7 +259,7 @@ object AppLogger {
                 logFile?.delete()
                 val file = logFile
                 if (file != null) {
-                    fileWriter = FileWriter(file, false)
+                    fileWriter = BufferedWriter(FileWriter(file, false), 8192)
                 }
                 totalLinesWrittenSinceCompact = 0
             } catch (t: Throwable) {

@@ -147,9 +147,6 @@ enum class AiCharacterPersona(
 }
 
 /**
- * The 7 languages supported by Fossistant's Fast TTS & Voice Pipeline.
- */
-/**
  * A speech language: every language Whisper understands (100) plus [AUTO], which detects the spoken language
  * on each utterance. Speaking uses whichever voice Android has installed for [locale].
  */

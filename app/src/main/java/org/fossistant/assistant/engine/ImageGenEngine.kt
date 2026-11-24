@@ -16,14 +16,13 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import okhttp3.OkHttpClient
-import okhttp3.Request
 import org.fossistant.assistant.model.ImageGenFile
 import org.fossistant.assistant.model.ImageGenFiles
 import org.fossistant.assistant.model.ImageGenModelChoice
+import org.fossistant.assistant.util.ResumableFileDownloader
 import java.io.File
 import java.io.FileOutputStream
-import java.security.MessageDigest
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
@@ -49,7 +48,7 @@ class ImageGenEngine(private val context: Context) {
     private val modelDir = File(context.filesDir, "imagegen").apply { mkdirs() }
     private val outputDir = File(context.filesDir, "generated_images").apply { mkdirs() }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val http = OkHttpClient.Builder()
+    private val http = org.fossistant.assistant.util.SharedHttp.client.newBuilder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
@@ -57,12 +56,25 @@ class ImageGenEngine(private val context: Context) {
     private val _downloads = MutableStateFlow<Map<ImageGenModelChoice, DownloadProgress>>(emptyMap())
     /** Downloads in progress (or failed, with [DownloadProgress.error]), by model. */
     val downloads: StateFlow<Map<ImageGenModelChoice, DownloadProgress>> = _downloads
-    private val downloadJobs = mutableMapOf<ImageGenModelChoice, Job>()
+    private val downloadJobs = ConcurrentHashMap<ImageGenModelChoice, Job>()
 
     private val generateLock = Mutex()
+    @Volatile
     private var handle = 0L
     private var loadedWithTinyVae: Boolean? = null
+    private var loadedUseGpu: Boolean? = null
     private var idleFreeJob: Job? = null
+
+    @Volatile
+    var isUsingGpu: Boolean = false
+        private set
+
+    val computeKind: String
+        get() = when {
+            handle == 0L -> "Standby"
+            isUsingGpu -> "GPU (Vulkan)"
+            else -> "CPU"
+        }
 
     init {
         // Files from models the app no longer offers (the first SD 1.5 Q4_0 and its LCM-LoRA) free their space.
@@ -120,7 +132,18 @@ class ImageGenEngine(private val context: Context) {
             require(isReady(choice)) { "${choice.displayName} isn't downloaded yet" }
             ensureLoaded(choice)
             val (width, height) = initImage?.let { sizeFor(it.width, it.height) } ?: (512 to 512)
-            val initRgb = initImage?.let { toRgb(Bitmap.createScaledBitmap(it, width, height, true)) }
+            val initRgb = initImage?.let { src ->
+                if (src.width == width && src.height == height) {
+                    toRgb(src)
+                } else {
+                    val scaled = Bitmap.createScaledBitmap(src, width, height, true)
+                    try {
+                        toRgb(scaled)
+                    } finally {
+                        if (scaled !== src) scaled.recycle()
+                    }
+                }
+            }
             val effectivePrompt = cleanAndEnrichPrompt(prompt)
             val rgb = nativeGenerate(
                 handle, effectivePrompt, NEGATIVE_PROMPT, width, height,
@@ -134,8 +157,12 @@ class ImageGenEngine(private val context: Context) {
             }
             val bitmap = fromRgb(rgb, width, height)
             val out = File(outputDir, "image_${System.currentTimeMillis()}.png")
-            withContext(Dispatchers.IO) {
-                FileOutputStream(out).use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            try {
+                withContext(Dispatchers.IO) {
+                    FileOutputStream(out).use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+                }
+            } finally {
+                bitmap.recycle()
             }
             out
         }
@@ -152,24 +179,30 @@ class ImageGenEngine(private val context: Context) {
 
     private fun ensureLoaded(choice: ImageGenModelChoice) {
         val wantTiny = choice.tinyVaeFile != null
-        if (handle != 0L && loadedWithTinyVae == wantTiny) return
+        val wantGpu = org.fossistant.assistant.FossistantApp.primaryHardwareBackend !=
+            org.fossistant.assistant.model.HardwareInferenceBackend.CPU
+        if (handle != 0L && loadedWithTinyVae == wantTiny && loadedUseGpu == wantGpu) return
         freeHandle()
         loadLibrary()
         val model = fileFor(choice.files.first()).absolutePath
         val taesd = choice.tinyVaeFile?.let { File(modelDir, it).absolutePath }
         // Performance + mid cores on 8-core mobile chips for faster CPU GEMM.
         val threads = (Runtime.getRuntime().availableProcessors() - 2).coerceIn(4, 6)
-        handle = nativeLoad(model, taesd, threads)
+        handle = nativeLoad(model, taesd, threads, wantGpu)
         if (handle == 0L) {
             throw IllegalStateException("Couldn't load ${choice.displayName}: " + nativeRecentLog().lines().lastOrNull { it.isNotBlank() }.orEmpty())
         }
+        isUsingGpu = runCatching { nativeIsUsingGpu(handle) }.getOrDefault(false)
         loadedWithTinyVae = wantTiny
+        loadedUseGpu = wantGpu
     }
 
     private fun freeHandle() {
         if (handle != 0L) nativeFree(handle)
         handle = 0L
+        isUsingGpu = false
         loadedWithTinyVae = null
+        loadedUseGpu = null
     }
 
     private fun scheduleIdleFree() {
@@ -182,57 +215,25 @@ class ImageGenEngine(private val context: Context) {
 
     private suspend fun downloadFile(file: ImageGenFile, onBytes: (Long) -> Unit) {
         val target = fileFor(file)
-        val part = File(modelDir, file.fileName + ".part")
-        if (part.length() > file.sizeBytes) part.delete()
-        val request = Request.Builder().url(file.url).apply {
-            if (part.length() > 0) header("Range", "bytes=${part.length()}-")
-        }.build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code} for ${file.fileName}")
-            val append = response.code == 206
-            var written = if (append) part.length() else 0L
-            val body = response.body ?: throw IllegalStateException("Empty response for ${file.fileName}")
-            FileOutputStream(part, append).use { out ->
-                body.byteStream().use { input ->
-                    val buffer = ByteArray(256 * 1024)
-                    var lastReport = 0L
-                    while (true) {
-                        coroutineContext.ensureActive()
-                        val read = input.read(buffer)
-                        if (read < 0) break
-                        out.write(buffer, 0, read)
-                        written += read
-                        if (written - lastReport > 4L * 1024 * 1024) {
-                            lastReport = written
-                            onBytes(written)
-                        }
-                    }
-                }
-            }
-        }
+        val part = ResumableFileDownloader.downloadToPart(
+            http = http,
+            url = file.url,
+            target = target,
+            expectedSizeBytes = file.sizeBytes,
+            label = file.fileName,
+            bufferSizeBytes = 256 * 1024,
+            reportStepBytes = 4L * 1024 * 1024
+        ) { bytes, _ -> onBytes(bytes) }
         if (part.length() != file.sizeBytes) throw IllegalStateException("${file.fileName} is incomplete; try again")
-        if (!sha256(part).equals(file.sha256, ignoreCase = true)) {
+        if (!ResumableFileDownloader.sha256(part, bufferSizeBytes = 1024 * 1024).equals(file.sha256, ignoreCase = true)) {
             part.delete()
             throw IllegalStateException("${file.fileName} was corrupted in transit; try again")
         }
-        if (!part.renameTo(target)) throw IllegalStateException("Couldn't save ${file.fileName}")
+        ResumableFileDownloader.installPartFile(part, target, file.fileName)
         onBytes(file.sizeBytes)
     }
 
     private fun fileFor(file: ImageGenFile) = File(modelDir, file.fileName)
-
-    private fun sha256(file: File): String {
-        val digest = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { input ->
-            val buffer = ByteArray(1024 * 1024)
-            while (true) {
-                val read = input.read(buffer)
-                if (read < 0) break
-                digest.update(buffer, 0, read)
-            }
-        }
-        return digest.digest().joinToString("") { "%02x".format(it) }
-    }
 
     companion object {
         private const val TAG = "ImageGenEngine"
@@ -309,7 +310,8 @@ class ImageGenEngine(private val context: Context) {
         }
     }
 
-    private external fun nativeLoad(modelPath: String, taesdPath: String?, nThreads: Int): Long
+    private external fun nativeLoad(modelPath: String, taesdPath: String?, nThreads: Int, useGpu: Boolean = true): Long
+    private external fun nativeIsUsingGpu(handle: Long): Boolean
     private external fun nativeGenerate(
         handle: Long, prompt: String, negativePrompt: String, width: Int, height: Int,
         steps: Int, cfg: Float, seed: Long, sampler: String, scheduler: String,

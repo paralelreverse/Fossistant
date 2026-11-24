@@ -8,40 +8,87 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Intelligent phonetic autocorrect and fuzzy application search matcher.
- * Compensates for Whisper ASR mishearings (e.g. "open fast assistent" -> "open Fossistant",
- * "spotfy" -> "Spotify", "u tube" -> "YouTube") using Levenshtein distance and token similarity.
+ * Phonetic wake-word / app-name normalization and conservative fuzzy application lookup.
  */
 object FuzzyAppAndCommandMatcher {
 
+    private const val APP_CACHE_TTL_MS = 60_000L
+    private const val MIN_FUZZY_SIMILARITY = 0.72f
+
+    private val LEADING_COMMAND_VERB_REGEX =
+        Regex("^(?:please\\s+)?(?:open|opem|opne|oepn|oppen|launch|start|run|bring up|show|go to|otvor(?:te)?|spusti(?:ť)?|zapni|otevři|otevri|otwórz|otworz|uruchom|odpal|открой(?:те)?|запусти(?:те)?|відкрий(?:те)?)\\s+")
+    private val LEADING_ARTICLE_REGEX =
+        Regex("^(?:the|my|a|an|aplikáci[au]|aplikaci[au]|aplikace|aplikac[jęe]|приложение|додаток)\\s+")
+    private val TRAILING_PUNCTUATION_REGEX = Regex("[\\p{Punct}\\s]+$")
+    private val TRAILING_APP_WORD_REGEX =
+        Regex("\\s+(?:app|application|apps|aplikácia|aplikáciu|aplikacja|aplikację|приложение)$")
+    private val WHITESPACE_REGEX = Regex("\\s+")
+    private val NON_ALPHANUM_REGEX = Regex("[^\\p{L}\\p{N}]+")
+
+    private data class CachedLauncherApp(
+        val resolveInfo: ResolveInfo,
+        val label: String,
+        val pkg: String
+    )
+
+    private data class LauncherCacheSnapshot(
+        val apps: List<CachedLauncherApp>,
+        val cachedAtMs: Long,
+        val pmIdentity: Int
+    )
+
+    @Volatile
+    private var launcherCache: LauncherCacheSnapshot? = null
+
+    fun invalidateAppCache() {
+        launcherCache = null
+    }
+
+    private fun getLauncherApps(pm: PackageManager): List<CachedLauncherApp> {
+        val now = System.currentTimeMillis()
+        val pmId = System.identityHashCode(pm)
+        val cached = launcherCache
+        if (cached != null && cached.pmIdentity == pmId && now - cached.cachedAtMs < APP_CACHE_TTL_MS) {
+            return cached.apps
+        }
+        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+        }
+        val installedApps = runCatching {
+            pm.queryIntentActivities(mainIntent, PackageManager.MATCH_ALL)
+        }.getOrNull().orEmpty()
+        val labeledApps = installedApps.map { app ->
+            val label = runCatching { app.loadLabel(pm).toString().trim().lowercase() }.getOrDefault("")
+            val pkg = app.activityInfo.packageName.lowercase()
+            CachedLauncherApp(app, label, pkg)
+        }
+        if (labeledApps.isNotEmpty()) {
+            launcherCache = LauncherCacheSnapshot(labeledApps, System.currentTimeMillis(), pmId)
+        }
+        return labeledApps
+    }
+
     /**
-     * Common phonetic and colloquial autocorrect substitutions for Whisper transcripts.
+     * Unambiguous multi-word phonetic corrections for wake-word detection and explicit app lookups.
      */
-    private val phoneticSubstitutions = listOf(
+    private val PHONETIC_APP_CORRECTIONS = listOf(
         Regex("(?i)\\b(fast\\s+assistent|fast\\s+assistant|foss\\s+assistant|fossasistent|foss\\s+assistent)\\b") to "fossistant",
-        Regex("(?i)\\b(opem|opne|oepn|oppen)\\b") to "open",
+        Regex("(?i)\\b(spot\\s*if\\s*y|spot\\s+if\\s+i|spotfy)\\b") to "spotify",
+        Regex("(?i)\\b(u\\s+tube|you\\s+tube)\\b") to "youtube",
+        Regex("(?i)\\bosm\\s*&|\\bosm\\s+and\\b") to "osmand",
         Regex("(?i)\\b(phptos|fotoss?|photoss?)\\b") to "photos",
         Regex("(?i)\\b(gallary|galery)\\b") to "gallery",
         Regex("(?i)\\b(settins|setings)\\b") to "settings",
-        Regex("(?i)\\b(messag(es)?|msg)\\b") to "messages",
-        Regex("(?i)\\b(camer[ao]|cam)\\b") to "camera",
-        Regex("(?i)\\b(calculater|calc)\\b") to "calculator",
         Regex("(?i)\\b(contacs|contatcs)\\b") to "contacts",
-        Regex("(?i)\\b(calender|calandar)\\b") to "calendar",
-        Regex("(?i)\\b(spot\\s*if\\s*y|spot\\s+if\\s+i|spotfy)\\b") to "spotify",
-        Regex("(?i)\\b(u\\s+tube|you\\s+tube)\\b") to "youtube",
-        Regex("(?i)\\b(whats\\s+app|what\\s+app)\\b") to "whatsapp",
-        Regex("(?i)\\b(insta\\s+gram)\\b") to "instagram",
-        Regex("(?i)\\b(torch|flash\\s*lite|flash\\s+light)\\b") to "flashlight",
-        Regex("(?i)\\bosm\\s*&|\\bosm\\s+and\\b") to "osmand",
-        Regex("(?i)\\b(shoot\\s+a\\s+text\\s+to|send\\s+a\\s+message\\s+to)\\b") to "send text to",
-        Regex("(?i)\\b(give\\s+([a-zA-Z0-9]+)\\s+a\\s+call)\\b") to "call $2",
-        Regex("(?i)\\b(drop\\s+([a-zA-Z0-9]+)\\s+a\\s+call)\\b") to "call $2"
+        Regex("(?i)\\bcalandar\\b") to "calendar",
+        Regex("(?i)\\bcalculater\\b") to "calculator",
+        Regex("(?i)\\bwhats\\s+app\\b") to "whatsapp",
+        Regex("(?i)\\binsta\\s+gram\\b") to "instagram"
     )
 
     /**
      * Cross-lingual application name translations (e.g. speaking in Slovak, Czech, or Polish
-     * while the phone launcher has apps in English). Applied during app name sanitization and matching.
+     * while the phone launcher has apps in English). Applied only during explicit app-name lookup.
      */
     private val crossLingualAppTranslations = listOf(
         Regex("(?i)\\b(galéri[au]|galeri[au]|galérie|galerie)\\b") to "gallery",
@@ -62,39 +109,32 @@ object FuzzyAppAndCommandMatcher {
     )
 
     /**
-     * Normalizes and autocorrects a raw speech transcript before routing.
+     * Applies unambiguous phonetic wake-word / app-name corrections without rewriting normal words or sentences.
      */
     fun autocorrectTranscript(rawTranscript: String): String {
         var corrected = rawTranscript.trim()
-        for ((regex, replacement) in phoneticSubstitutions) {
+        for ((regex, replacement) in PHONETIC_APP_CORRECTIONS) {
             corrected = regex.replace(corrected, replacement)
         }
         return corrected
     }
 
     /**
-     * Normalizes an app name search query by stripping common command verbs,
-     * articles, suffixes like "app" or "application", punctuation, and translating
-     * cross-lingual Slavic app nouns to English canonical names.
+     * Normalizes an explicit app name query by stripping command verbs, articles, trailing "app" suffix,
+     * applying phonetic app-name fixes, and translating common cross-lingual app nouns to English.
      */
     fun sanitizeAppQuery(query: String): String {
         var q = autocorrectTranscript(query).trim().lowercase()
-        // Strip leading command verbs in English, Slovak, Czech, Polish, Russian, Ukrainian
-        q = q.replace(Regex("^(?:please\\s+)?(?:open|opem|opne|oepn|oppen|launch|start|run|bring up|show|go to|otvor(?:te)?|spusti(?:ť)?|zapni|otevři|otevri|otwórz|otworz|uruchom|odpal|открой(?:те)?|запусти(?:те)?|відкрий(?:те)?)\\s+"), "")
-        // Strip leading articles or application descriptors
-        q = q.replace(Regex("^(?:the|my|a|an|aplikáci[au]|aplikaci[au]|aplikace|aplikac[jęe]|приложение|додаток)\\s+"), "")
-        // Strip trailing punctuation
-        q = q.replace(Regex("[\\p{Punct}\\s]+$"), "").trim()
-        // Strip trailing "app" or "application" or "apps" or Slavic variants
-        q = q.replace(Regex("\\s+(?:app|application|apps|aplikácia|aplikáciu|aplikacja|aplikację|приложение)$"), "")
-        // Strip trailing punctuation again
-        q = q.replace(Regex("[\\p{Punct}\\s]+$"), "").trim()
+        q = q.replace(LEADING_COMMAND_VERB_REGEX, "")
+        q = q.replace(LEADING_ARTICLE_REGEX, "")
+        q = q.replace(TRAILING_PUNCTUATION_REGEX, "").trim()
+        q = q.replace(TRAILING_APP_WORD_REGEX, "")
+        q = q.replace(TRAILING_PUNCTUATION_REGEX, "").trim()
 
-        // Translate cross-lingual app nouns to English so Slavic requests match English launcher labels
         for ((regex, replacement) in crossLingualAppTranslations) {
             q = regex.replace(q, replacement)
         }
-        return q
+        return q.replace(WHITESPACE_REGEX, " ").trim()
     }
 
     /**
@@ -130,75 +170,14 @@ object FuzzyAppAndCommandMatcher {
     }
 
     /**
-     * Resolves the best matching installed Android application package for a given search query,
-     * using exact matching, alias lookup, prefix matching, token similarity, and fuzzy edit distance.
+     * Resolves the best matching installed Android application package for an explicit app name query.
      */
     fun findBestMatchingApp(context: Context?, query: String): ResolveInfo? {
         if (context == null || query.isBlank()) return null
         val pm = context.packageManager ?: return null
-        val cleanQuery = autocorrectTranscript(query).trim().lowercase()
-        val sanitizedQuery = sanitizeAppQuery(query).ifBlank { cleanQuery }
-
-        val mainIntent = Intent(Intent.ACTION_MAIN, null).apply {
-            addCategory(Intent.CATEGORY_LAUNCHER)
-        }
-        val installedApps = runCatching {
-            pm.queryIntentActivities(mainIntent, PackageManager.MATCH_ALL)
-        }.getOrNull().orEmpty()
-
-        if (installedApps.isEmpty()) return null
-
-        // Resolve each launcher activity's label once so we don't repeat IPC calls across the 3 matching passes
-        val labeledApps = installedApps.map { app ->
-            val label = runCatching { app.loadLabel(pm).toString().trim().lowercase() }.getOrDefault("")
-            val pkg = app.activityInfo.packageName.lowercase()
-            Triple(app, label, pkg)
-        }
-
-        // 1. Exact match against app label or package
-        for ((app, label, pkg) in labeledApps) {
-            if (label == cleanQuery || pkg == cleanQuery || label == sanitizedQuery || pkg == sanitizedQuery) {
-                return app
-            }
-        }
-
-        // 2. StartsWith or Contains match
-        for ((app, label, _) in labeledApps) {
-            if (label.isNotEmpty() && (
-                    label.startsWith(sanitizedQuery) || sanitizedQuery.startsWith(label) ||
-                        label.contains(sanitizedQuery) || sanitizedQuery.contains(label) ||
-                        label.startsWith(cleanQuery) || cleanQuery.startsWith(label) || label.contains(cleanQuery)
-                    )
-            ) {
-                return app
-            }
-        }
-
-        // 3. Fuzzy edit distance & token-level search across all installed app labels
-        var bestApp: ResolveInfo? = null
-        var highestScore = 0.52f // Minimum similarity threshold to capture typos like "phptos" (0.83)
-
-        for ((app, label, _) in labeledApps) {
-            if (label.isEmpty()) continue
-            val score = max(similarityScore(cleanQuery, label), similarityScore(sanitizedQuery, label))
-
-            // Token-level matching (e.g. "Photos" in "Google Photos" vs "phptos")
-            val tokenScore = label.split(Regex("[^a-zA-Z0-9]+"))
-                .filter { it.length >= 3 }
-                .maxOfOrNull { similarityScore(sanitizedQuery, it) } ?: 0f
-
-            val strippedQuery = sanitizedQuery.replace(Regex("\\s+"), "")
-            val strippedLabel = label.replace(Regex("\\s+"), "")
-            val strippedScore = similarityScore(strippedQuery, strippedLabel)
-            val effectiveScore = max(max(score, strippedScore), tokenScore)
-
-            if (effectiveScore > highestScore) {
-                highestScore = effectiveScore
-                bestApp = app
-            }
-        }
-
-        return bestApp
+        val labeledApps = getLauncherApps(pm)
+        if (labeledApps.isEmpty()) return null
+        return matchAppCandidate(query, labeledApps, { it.label }, { it.pkg })?.resolveInfo
     }
 
     data class AppMatchCandidate(val label: String, val packageName: String)
@@ -206,45 +185,62 @@ object FuzzyAppAndCommandMatcher {
     /**
      * Finds the best matching candidate from a provided list of app names/packages without Android Context.
      */
-    fun findBestMatchCandidate(query: String, candidates: List<AppMatchCandidate>): AppMatchCandidate? {
-        val cleanQuery = autocorrectTranscript(query).trim().lowercase()
-        val sanitizedQuery = sanitizeAppQuery(query).ifBlank { cleanQuery }
+    fun findBestMatchCandidate(query: String, candidates: List<AppMatchCandidate>): AppMatchCandidate? =
+        matchAppCandidate(query, candidates, { it.label }, { it.packageName })
 
-        // 1. Exact match
-        for (c in candidates) {
-            val label = c.label.trim().lowercase()
-            val pkg = c.packageName.lowercase()
-            if (label == cleanQuery || pkg == cleanQuery || label == sanitizedQuery || pkg == sanitizedQuery) return c
-        }
-        // 2. StartsWith or Contains match
-        for (c in candidates) {
-            val label = c.label.trim().lowercase()
-            if (label.startsWith(sanitizedQuery) || sanitizedQuery.startsWith(label) ||
-                label.contains(sanitizedQuery) || sanitizedQuery.contains(label) ||
-                label.startsWith(cleanQuery) || cleanQuery.startsWith(label) || label.contains(cleanQuery)
-            ) return c
-        }
-        // 3. Fuzzy edit distance & token search
-        var best: AppMatchCandidate? = null
-        var highestScore = 0.52f
-        for (c in candidates) {
-            val label = c.label.trim().lowercase()
-            val score = max(similarityScore(cleanQuery, label), similarityScore(sanitizedQuery, label))
+    private fun <T> matchAppCandidate(
+        query: String,
+        candidates: List<T>,
+        labelOf: (T) -> String,
+        packageOf: (T) -> String
+    ): T? {
+        val sanitizedQuery = sanitizeAppQuery(query)
+        if (sanitizedQuery.length < 2 || candidates.isEmpty()) return null
 
-            val tokenScore = label.split(Regex("[^a-zA-Z0-9]+"))
-                .filter { it.length >= 3 }
-                .maxOfOrNull { similarityScore(sanitizedQuery, it) } ?: 0f
-
-            val strippedQuery = sanitizedQuery.replace(Regex("\\s+"), "")
-            val strippedLabel = label.replace(Regex("\\s+"), "")
-            val strippedScore = similarityScore(strippedQuery, strippedLabel)
-            val effectiveScore = max(max(score, strippedScore), tokenScore)
-
-            if (effectiveScore > highestScore) {
-                highestScore = effectiveScore
-                best = c
+        // 1. Exact match against app label, package name, or package suffix.
+        for (candidate in candidates) {
+            val label = labelOf(candidate).trim().lowercase()
+            val pkg = packageOf(candidate).trim().lowercase()
+            val pkgSuffix = pkg.substringAfterLast('.')
+            if (label == sanitizedQuery || pkg == sanitizedQuery || pkgSuffix == sanitizedQuery) {
+                return candidate
             }
         }
+
+        // 2. Prefix or whole-word match for queries >= 3 chars (never arbitrary sanitizedQuery.contains(label)).
+        if (sanitizedQuery.length >= 3) {
+            for (candidate in candidates) {
+                val label = labelOf(candidate).trim().lowercase()
+                if (label.isEmpty()) continue
+                val words = label.split(NON_ALPHANUM_REGEX).filter { it.isNotEmpty() }
+                if (label.startsWith(sanitizedQuery) || words.any { it == sanitizedQuery }) {
+                    return candidate
+                }
+            }
+        }
+
+        // 3. Conservative typo tolerance against full label and label words >= 4 chars.
+        var best: T? = null
+        var highestScore = 0f
+        val strippedQuery = sanitizedQuery.replace(WHITESPACE_REGEX, "")
+
+        for (candidate in candidates) {
+            val label = labelOf(candidate).trim().lowercase()
+            if (label.isEmpty()) continue
+
+            val labelScore = similarityScore(sanitizedQuery, label)
+            val strippedScore = similarityScore(strippedQuery, label.replace(WHITESPACE_REGEX, ""))
+            val wordScore = label.split(NON_ALPHANUM_REGEX)
+                .filter { it.length >= 4 }
+                .maxOfOrNull { similarityScore(sanitizedQuery, it) } ?: 0f
+
+            val effectiveScore = max(max(labelScore, strippedScore), wordScore)
+            if (effectiveScore >= MIN_FUZZY_SIMILARITY && effectiveScore > highestScore) {
+                highestScore = effectiveScore
+                best = candidate
+            }
+        }
+
         return best
     }
 }

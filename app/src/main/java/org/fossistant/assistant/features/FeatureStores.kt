@@ -10,7 +10,9 @@ import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * A list of items saved as JSON in the app's private storage, written on a background thread. Used for
@@ -21,19 +23,45 @@ class JsonListStore<T>(
     fileName: String,
     private val serializer: KSerializer<T>,
     private val idOf: (T) -> String,
-    defaults: () -> List<T> = { emptyList() }
+    eagerLoad: Boolean = true,
+    private val defaults: () -> List<T> = { emptyList() }
 ) {
     private val file: File? = storageDir?.let { File(it, "features").apply { mkdirs() }.resolve(fileName) }
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private val listSerializer = ListSerializer(serializer)
-    private val writer = Executors.newSingleThreadExecutor { Thread(it, "FeatureStore-$fileName").apply { isDaemon = true } }
+    private val writer = sharedWriter
+    private val diskLoaded = AtomicBoolean(false)
+    private val mutatedBeforeLoad = AtomicBoolean(false)
 
-    private val _items = MutableStateFlow(load() ?: defaults())
+    private val _items = MutableStateFlow(emptyList<T>())
     val items: StateFlow<List<T>> = _items.asStateFlow()
+
+    init {
+        if (eagerLoad) loadIfNeeded()
+    }
+
+    /** Loads persisted items once from disk (or falls back to [defaults]), safe for `Dispatchers.IO`. */
+    fun loadIfNeeded() {
+        if (!diskLoaded.compareAndSet(false, true)) return
+        val initial = load() ?: defaults()
+        _items.update { earlyEdits ->
+            if (!mutatedBeforeLoad.get() || earlyEdits.isEmpty()) {
+                initial
+            } else {
+                val merged = initial.toMutableList()
+                for (edited in earlyEdits) {
+                    val idx = merged.indexOfFirst { idOf(it) == idOf(edited) }
+                    if (idx >= 0) merged[idx] = edited else merged.add(edited)
+                }
+                merged
+            }
+        }
+    }
 
     fun get(id: String): T? = _items.value.firstOrNull { idOf(it) == id }
 
     fun upsert(item: T) {
+        if (!diskLoaded.get()) mutatedBeforeLoad.set(true)
         _items.update { current ->
             val index = current.indexOfFirst { idOf(it) == idOf(item) }
             if (index >= 0) current.toMutableList().apply { set(index, item) } else current + item
@@ -42,6 +70,7 @@ class JsonListStore<T>(
     }
 
     fun delete(id: String) {
+        if (!diskLoaded.get()) mutatedBeforeLoad.set(true)
         _items.update { current -> current.filterNot { idOf(it) == id } }
         persist()
     }
@@ -69,6 +98,12 @@ class JsonListStore<T>(
             }
         }
     }
+
+    private companion object {
+        val sharedWriter = Executors.newSingleThreadExecutor {
+            Thread(it, "FeatureStoreWriter").apply { isDaemon = true }
+        }
+    }
 }
 
 fun newId(): String = UUID.randomUUID().toString()
@@ -89,11 +124,16 @@ data class Skill(
         val text = prompt.trim().lowercase()
         return enabled && triggers.any { trigger ->
             val t = trigger.trim().lowercase()
-            t.isNotEmpty() && (text.startsWith(t) || Regex("\\b${Regex.escape(t)}\\b").containsMatchIn(text))
+            t.isNotEmpty() && (text.startsWith(t) || wordBoundaryRegex(t).containsMatchIn(text))
         }
     }
 
     companion object {
+        private val triggerRegexCache = ConcurrentHashMap<String, Regex>()
+
+        private fun wordBoundaryRegex(trigger: String): Regex =
+            triggerRegexCache.computeIfAbsent(trigger) { Regex("\\b${Regex.escape(it)}\\b") }
+
         val DEFAULTS = listOf(
             Skill(
                 name = "Proofreader",

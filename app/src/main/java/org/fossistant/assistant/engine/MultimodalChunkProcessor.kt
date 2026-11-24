@@ -2,6 +2,7 @@ package org.fossistant.assistant.engine
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import kotlinx.coroutines.CoroutineDispatcher
@@ -9,6 +10,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.InputStreamReader
 import kotlin.math.max
 import kotlin.math.min
@@ -34,6 +36,7 @@ class MultimodalChunkProcessor(
         const val MAX_VIDEO_KEYFRAMES = 4
         const val PHOTO_TARGET_MAX_DIM = 768
         const val VISION_TARGET_MAX_DIM = 512
+        private val TOKEN_SPLIT_REGEX = Regex("[^\\p{L}\\p{N}]+")
     }
 
     /**
@@ -83,7 +86,7 @@ class MultimodalChunkProcessor(
     ): List<String> {
         if (chunks.size <= topK) return chunks
         val queryTerms = query.lowercase()
-            .split(Regex("[^a-z0-9]+"))
+            .split(TOKEN_SPLIT_REGEX)
             .filter { it.length > 2 }
             .toSet()
 
@@ -182,26 +185,75 @@ class MultimodalChunkProcessor(
     }
 
     /**
+     * Subsamples and downscales an image straight from disk or a `content://` [Uri] without buffering
+     * a multi-megabyte full-resolution original into Java heap first.
+     */
+    fun downscaleImagePathOrUriJpeg(pathOrUri: String, maxDimension: Int = PHOTO_TARGET_MAX_DIM): ByteArray? {
+        return try {
+            if (pathOrUri.startsWith("/")) {
+                val file = File(pathOrUri)
+                if (!file.exists()) return null
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeFile(pathOrUri, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return file.readBytes()
+                if (bounds.outWidth <= maxDimension && bounds.outHeight <= maxDimension) return file.readBytes()
+                var sample = 1
+                while (bounds.outWidth / (sample * 2) >= maxDimension && bounds.outHeight / (sample * 2) >= maxDimension) sample *= 2
+                val decoded = BitmapFactory.decodeFile(
+                    pathOrUri,
+                    BitmapFactory.Options().apply { inSampleSize = sample }
+                ) ?: return file.readBytes()
+                return encodeDownscaledJpeg(decoded, maxDimension)
+            }
+            val ctx = context ?: return null
+            val uri = Uri.parse(pathOrUri)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) } ?: return null
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                return ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            }
+            if (bounds.outWidth <= maxDimension && bounds.outHeight <= maxDimension) {
+                return ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            }
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= maxDimension && bounds.outHeight / (sample * 2) >= maxDimension) sample *= 2
+            val decoded = ctx.contentResolver.openInputStream(uri)?.use {
+                BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+            } ?: return null
+            encodeDownscaledJpeg(decoded, maxDimension)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun encodeDownscaledJpeg(decoded: Bitmap, maxDimension: Int): ByteArray {
+        val scaled = scaleDownBitmap(decoded, maxDimension)
+        val out = ByteArrayOutputStream()
+        try {
+            scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            return out.toByteArray()
+        } finally {
+            if (scaled !== decoded) scaled.recycle()
+            decoded.recycle()
+        }
+    }
+
+    /**
      * Re-encodes a photo so its longest side is at most [maxDimension] (full-resolution camera photos are
      * slow to encode and waste memory in the vision encoder). Returns the input if it can't be decoded.
      */
     fun downscaleImageJpeg(bytes: ByteArray, maxDimension: Int = PHOTO_TARGET_MAX_DIM): ByteArray {
         return try {
-            val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
             if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return bytes
             if (bounds.outWidth <= maxDimension && bounds.outHeight <= maxDimension) return bytes
             var sample = 1
             while (bounds.outWidth / (sample * 2) >= maxDimension && bounds.outHeight / (sample * 2) >= maxDimension) sample *= 2
-            val decoded = android.graphics.BitmapFactory.decodeByteArray(
-                bytes, 0, bytes.size, android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+            val decoded = BitmapFactory.decodeByteArray(
+                bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample }
             ) ?: return bytes
-            val scaled = scaleDownBitmap(decoded, maxDimension)
-            val out = java.io.ByteArrayOutputStream()
-            scaled.compress(Bitmap.CompressFormat.JPEG, 85, out)
-            if (scaled !== decoded) scaled.recycle()
-            decoded.recycle()
-            out.toByteArray()
+            encodeDownscaledJpeg(decoded, maxDimension)
         } catch (_: Throwable) {
             bytes
         }

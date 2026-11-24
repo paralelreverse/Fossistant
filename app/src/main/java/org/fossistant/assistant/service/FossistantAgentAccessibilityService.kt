@@ -81,6 +81,157 @@ class FossistantAgentAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Finds a node matching [queryText] (case-insensitive) and performs a click on it or its
+     * nearest clickable parent.
+     */
+    fun clickNodeByText(queryText: String): Boolean {
+        if (queryText.isBlank()) return false
+        val root = rootInActiveWindow ?: return false
+        val cleanQuery = queryText.trim().lowercase()
+
+        fun clickNearestAncestor(start: AccessibilityNodeInfo?): Boolean {
+            var current = start
+            while (current != null) {
+                if (current.isClickable && current.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                    return true
+                }
+                current = current.parent
+            }
+            return false
+        }
+
+        // 0. Exact label match first, so "OK" never taps "Book" and "Pay" never taps "PayPal".
+        var exactClicked = false
+        fun searchExact(node: AccessibilityNodeInfo?) {
+            if (node == null || exactClicked) return
+            val label = (node.text ?: node.contentDescription ?: node.hintText)?.toString()?.trim()?.lowercase()
+            if (label == cleanQuery && clickNearestAncestor(node)) {
+                exactClicked = true
+                return
+            }
+            for (i in 0 until node.childCount) {
+                if (exactClicked) break
+                searchExact(node.getChild(i))
+            }
+        }
+        searchExact(root)
+        if (exactClicked) return true
+
+        // 1. Try finding by AccessibilityManager text match
+        val matches = root.findAccessibilityNodeInfosByText(cleanQuery)
+        for (node in matches) {
+            if (clickNearestAncestor(node)) return true
+        }
+
+        // 2. Fallback search through all nodes inspecting text, contentDescription, and hintText
+        var clicked = false
+        fun searchSubstring(node: AccessibilityNodeInfo?) {
+            if (node == null || clicked) return
+            val text = node.text?.toString()?.lowercase()
+            val desc = node.contentDescription?.toString()?.lowercase()
+            val hint = node.hintText?.toString()?.lowercase()
+            if ((text != null && text.contains(cleanQuery)) ||
+                (desc != null && desc.contains(cleanQuery)) ||
+                (hint != null && hint.contains(cleanQuery))
+            ) {
+                if (clickNearestAncestor(node)) {
+                    clicked = true
+                    return
+                }
+            }
+            for (i in 0 until node.childCount) {
+                if (clicked) break
+                searchSubstring(node.getChild(i))
+            }
+        }
+        searchSubstring(root)
+        return clicked
+    }
+
+    /**
+     * Types [text] into an editable input field on the active screen.
+     * If [targetField] is provided, attempts to target that field; otherwise uses active focus or the first editable node.
+     */
+    fun inputTextIntoNode(text: String, targetField: String? = null): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val arguments = android.os.Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        }
+
+        if (!targetField.isNullOrBlank()) {
+            val cleanTarget = targetField.trim().lowercase()
+            val matches = root.findAccessibilityNodeInfosByText(targetField)
+            for (node in matches) {
+                if (node.isEditable && node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) {
+                    return true
+                }
+            }
+            var matchedEditable: AccessibilityNodeInfo? = null
+            fun findMatchingEditable(node: AccessibilityNodeInfo?) {
+                if (node == null || matchedEditable != null) return
+                if (node.isEditable) {
+                    val label = listOfNotNull(node.text, node.contentDescription, node.hintText)
+                        .joinToString(" ").lowercase()
+                    if (label.contains(cleanTarget)) {
+                        matchedEditable = node
+                        return
+                    }
+                }
+                for (i in 0 until node.childCount) {
+                    if (matchedEditable != null) break
+                    findMatchingEditable(node.getChild(i))
+                }
+            }
+            findMatchingEditable(root)
+            if (matchedEditable?.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments) == true) {
+                return true
+            }
+        }
+
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        if (focused != null && focused.isEditable && focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)) {
+            return true
+        }
+
+        var firstEditable: AccessibilityNodeInfo? = null
+        fun findFirstEditable(node: AccessibilityNodeInfo?) {
+            if (node == null || firstEditable != null) return
+            if (node.isEditable) {
+                firstEditable = node
+                return
+            }
+            for (i in 0 until node.childCount) {
+                if (firstEditable != null) break
+                findFirstEditable(node.getChild(i))
+            }
+        }
+        findFirstEditable(root)
+        return firstEditable?.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments) ?: false
+    }
+
+    /**
+     * Scrolls the first scrollable container on the active screen.
+     */
+    fun scrollActiveScreen(forward: Boolean = true): Boolean {
+        val root = rootInActiveWindow ?: return false
+        fun findScrollable(node: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
+            if (node == null) return null
+            if (node.isScrollable) return node
+            for (i in 0 until node.childCount) {
+                findScrollable(node.getChild(i))?.let { return it }
+            }
+            return null
+        }
+        val scrollable = findScrollable(root) ?: return false
+        val action = if (forward) {
+            AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+        } else {
+            AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        }
+        return scrollable.performAction(action)
+    }
+
+    /**
      * Captures the current screen as a JPEG (longest side [maxDimension]) for Gemma's vision encoder.
      * Needs Android 11+; returns null when unavailable or refused.
      */

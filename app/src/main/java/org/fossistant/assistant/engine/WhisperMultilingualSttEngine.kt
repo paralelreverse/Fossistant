@@ -39,7 +39,6 @@ import kotlinx.coroutines.withContext
 import org.fossistant.assistant.model.HardwareInferenceBackend
 import org.fossistant.assistant.model.SupportedLanguage
 import org.fossistant.assistant.model.WhisperModelChoice
-import org.fossistant.assistant.tools.FuzzyAppAndCommandMatcher
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -55,7 +54,7 @@ import kotlin.math.sqrt
  * 2. Real-time Audio-Synced Amplitude: Computes normalized 60fps RMS dB and [normalizedAudioLevel] `[0.0f, 1.0f]`
  *    from raw 16kHz PCM samples to drive the [org.fossistant.assistant.ui.components.CosmicAiBlob] animation.
  * 3. Native `whisper.cpp` JNI Decoder (`libwhisper_jni.so`): Decodes captured 16kHz mono PCM directly against
- *    the bundled Whisper multilingual checkpoints across all 7 languages.
+ *    the bundled Whisper multilingual checkpoints across 100 languages.
  * 4. Toggleable Mic & Silence Timeouts: Tapping the mic while listening immediately turns the mic off, and
  *    automatic no-speech / trailing-silence timeouts prevent hanging.
  */
@@ -63,6 +62,7 @@ class WhisperMultilingualSttEngine(
     private val context: Context?,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO
 ) {
+    private val engineScope = CoroutineScope(kotlinx.coroutines.SupervisorJob() + ioDispatcher)
     private val isRecording = AtomicBoolean(false)
     private var recordingJob: Job? = null
     private var systemRecognizer: SpeechRecognizer? = null
@@ -104,6 +104,13 @@ class WhisperMultilingualSttEngine(
     /** Notified when duplex speakerphone routing (MODE_IN_COMMUNICATION) is switched on or off. */
     var onCommunicationModeChanged: ((Boolean) -> Unit)? = null
 
+    /**
+     * Experimental Gemma voice input: a spoken prompt is not transcribed. Its recording is saved as a WAV file
+     * and delivered as [VOICE_AUDIO_PREFIX] + path, which the chat sends to Gemma as audio. Whisper isn't loaded.
+     */
+    @Volatile
+    var audioToGemma: Boolean = false
+
     /** Incremented by every start/stop; a session only touches shared state while its id is current. */
     private val sessionCounter = AtomicLong(0L)
     private val communicationRoutingActive = AtomicBoolean(false)
@@ -118,12 +125,22 @@ class WhisperMultilingualSttEngine(
     var hardwareBackend: HardwareInferenceBackend = HardwareInferenceBackend.AUTO
         private set
 
+    val isUsingGpu: Boolean
+        get() = sharedWhisperHandle != 0L && sharedIsUsingGpu
+
     /**
-     * The bundled `libwhisper_jni.so` decodes on the CPU (4 threads); the hardware-backend preference is
-     * stored but cannot switch whisper.cpp to a GPU/NPU at runtime, so status reports what actually runs.
+     * Reports the active Whisper backend: Vulkan GPU when initialized on GPU (with automatic CPU
+     * fallback), or the selected [hardwareBackend] preference while in standby.
      */
     val computeKind: String
-        get() = "CPU"
+        get() = when {
+            sharedWhisperHandle != 0L && sharedIsUsingGpu -> "GPU (Vulkan)"
+            sharedWhisperHandle != 0L -> "CPU"
+            hardwareBackend == HardwareInferenceBackend.CPU -> "CPU"
+            hardwareBackend == HardwareInferenceBackend.GPU ||
+                hardwareBackend == HardwareInferenceBackend.NPU -> "GPU (Vulkan)"
+            else -> "GPU/CPU (Auto)"
+        }
 
     private val _memoryStatus = MutableStateFlow(if (sharedWhisperHandle != 0L) formatMemoryStatus() else "Loading...")
     val memoryStatus: StateFlow<String> = _memoryStatus.asStateFlow()
@@ -132,8 +149,16 @@ class WhisperMultilingualSttEngine(
     val lastLatencyMs: StateFlow<Long> = _lastLatencyMs.asStateFlow()
 
     fun setHardwareBackend(backend: HardwareInferenceBackend) {
+        val prevWantGpu = hardwareBackend != HardwareInferenceBackend.CPU
+        val wantGpu = backend != HardwareInferenceBackend.CPU
         hardwareBackend = backend
         updateMemoryStatus()
+        if (prevWantGpu != wantGpu && sharedWhisperHandle != 0L && isJniLibraryLoaded) {
+            engineScope.launch {
+                releaseWhisper()
+                ensureNativeWhisperInitialized()
+            }
+        }
     }
 
     fun formatMemoryStatus(): String {
@@ -153,7 +178,8 @@ class WhisperMultilingualSttEngine(
         }
     }
 
-    private external fun nativeInitWhisper(modelPath: String): Long
+    private external fun nativeInitWhisper(modelPath: String, useGpu: Boolean = hardwareBackend != HardwareInferenceBackend.CPU): Long
+    private external fun nativeIsUsingGpu(handle: Long): Boolean
     private external fun nativeTranscribePcm16(
         handle: Long,
         pcmSamples: ShortArray,
@@ -164,6 +190,27 @@ class WhisperMultilingualSttEngine(
 
     companion object {
         const val SAMPLE_RATE_HZ = 16000
+
+        /** Final result of a Gemma voice-input utterance: this prefix plus the WAV file's path. */
+        const val VOICE_AUDIO_PREFIX = "\u0001gemma-voice:"
+        private const val MAX_VOICE_CLIPS = 20
+
+        /** The recording's path when [text] is a Gemma voice-input result, otherwise null. */
+        fun voiceAudioPath(text: String): String? =
+            if (text.startsWith(VOICE_AUDIO_PREFIX)) text.removePrefix(VOICE_AUDIO_PREFIX) else null
+
+        /** 16-bit mono PCM wrapped in a WAV header (what LiteRT's audio input decodes). */
+        fun pcm16ToWav(samples: ShortArray, count: Int, sampleRate: Int): ByteArray {
+            val dataBytes = count * 2
+            val buffer = java.nio.ByteBuffer.allocate(44 + dataBytes).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            buffer.put("RIFF".toByteArray(Charsets.US_ASCII)).putInt(36 + dataBytes)
+            buffer.put("WAVE".toByteArray(Charsets.US_ASCII))
+            buffer.put("fmt ".toByteArray(Charsets.US_ASCII)).putInt(16)
+                .putShort(1).putShort(1).putInt(sampleRate).putInt(sampleRate * 2).putShort(2).putShort(16)
+            buffer.put("data".toByteArray(Charsets.US_ASCII)).putInt(dataBytes)
+            for (i in 0 until count) buffer.putShort(samples[i])
+            return buffer.array()
+        }
         const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
         private const val INITIAL_SILENCE_MAX_MS = 7000L // 7s max wait if no speech is detected
@@ -171,6 +218,12 @@ class WhisperMultilingualSttEngine(
         private const val SPECULATIVE_DECODE_AFTER_MS = 300L // start decoding this long into a pause
         private const val HARD_BARGE_IN_VOICED_MS = 1500L // sustained speech over TTS = real interruption (a long "hmmm" isn't)
         private const val MIN_UTTERANCE_VOICED_MS = 128L  // shorter bursts are clicks/coughs, not speech
+
+        /** Gemma voice input has no words to judge a pause by: wait this long after speech ends (generous). */
+        internal const val GEMMA_END_OF_SPEECH_MS = 1500L
+
+        /** A frame this far below the speaker's own level is quiet, even if the detector calls it voice. */
+        internal const val SPEECH_GATE_DROP_DB = 15f
         /** Quietest frame that can count as speech (filtered RMS, dB of 16-bit samples). */
         internal const val SPEECH_MIN_DB = 42.0f
         /**
@@ -197,9 +250,12 @@ class WhisperMultilingualSttEngine(
             if (normalized.isEmpty()) return true
             if (normalized in WHISPER_HALLUCINATIONS) return true
             // Repeated single token ("you you you you") is a classic silence hallucination.
-            val words = normalized.split(Regex("\\s+"))
+            val words = normalized.split(MULTI_SPACE_REGEX)
             return words.size >= 3 && words.toSet().size == 1
         }
+        private val BRACKET_ARTIFACT_REGEX = Regex("\\[.*?\\]")
+        private val PAREN_ARTIFACT_REGEX = Regex("\\(.*?\\)")
+        private val MULTI_SPACE_REGEX = Regex("\\s+")
         const val WHISPER_MODEL_FILENAME = "whisper-small-q5_1.bin"
 
         @Volatile
@@ -212,6 +268,9 @@ class WhisperMultilingualSttEngine(
 
         @Volatile
         private var sharedWhisperHandle: Long = 0L
+
+        @Volatile
+        private var sharedIsUsingGpu: Boolean = false
 
         @Volatile
         private var isJniLibraryLoaded: Boolean = false
@@ -331,6 +390,7 @@ class WhisperMultilingualSttEngine(
             if (sharedWhisperHandle != 0L) {
                 runCatching { nativeFreeWhisper(sharedWhisperHandle) }
                 sharedWhisperHandle = 0L
+                sharedIsUsingGpu = false
             }
             activeModel = choice
             _memoryStatus.value = "Loading (${choice.ramBadge})..."
@@ -340,28 +400,12 @@ class WhisperMultilingualSttEngine(
                 _memoryStatus.value = "Missing (${choice.ramBadge})"
                 return@withLock false
             }
-            return@withLock try {
-                if (!isJniLibraryLoaded) {
-                    runCatching { System.loadLibrary("c++_shared") }
-                    System.loadLibrary("whisper_jni")
-                    isJniLibraryLoaded = true
-                }
-                val handle = nativeInitWhisper(modelFile.absolutePath)
-                if (handle != 0L) {
-                    sharedWhisperHandle = handle
-                    _lastError.value = null
-                    _memoryStatus.value = formatMemoryStatus()
-                    true
-                } else {
-                    _lastError.value = "Failed to load ${choice.displayName}."
-                    _memoryStatus.value = formatMemoryStatus()
-                    false
-                }
-            } catch (t: Throwable) {
-                _lastError.value = "Whisper error: ${t.message}"
-                _memoryStatus.value = formatMemoryStatus()
-                false
-            }
+            return@withLock initNativeHandleLocked(
+                choice = choice,
+                modelFile = modelFile,
+                failureStatus = formatMemoryStatus(),
+                zeroHandleMessage = "Failed to load ${choice.displayName}."
+            )
         }
     }
 
@@ -381,31 +425,49 @@ class WhisperMultilingualSttEngine(
                 _memoryStatus.value = "Missing (${activeModel.ramBadge})"
                 return@withLock false
             }
-            return@withLock try {
-                if (!isJniLibraryLoaded) {
-                    runCatching { System.loadLibrary("c++_shared") }
-                    System.loadLibrary("whisper_jni")
-                    isJniLibraryLoaded = true
-                }
-                val handle = nativeInitWhisper(modelFile.absolutePath)
-                if (handle != 0L) {
-                    sharedWhisperHandle = handle
-                    _lastError.value = null
-                    _memoryStatus.value = formatMemoryStatus()
-                    true
-                } else {
-                    _lastError.value = "nativeInitWhisper returned 0 for ${modelFile.absolutePath}"
-                    _memoryStatus.value = "Fallback"
-                    false
-                }
-            } catch (t: Throwable) {
-                if (context != null) {
-                    _lastError.value = "Whisper JNI load notice: ${t.message}"
-                }
-                _memoryStatus.value = "Fallback"
-                false
-            }
+            return@withLock initNativeHandleLocked(
+                choice = activeModel,
+                modelFile = modelFile,
+                failureStatus = "Fallback",
+                zeroHandleMessage = "nativeInitWhisper returned 0 for ${modelFile.absolutePath}",
+                suppressLoadErrorWhenNoContext = true
+            )
         }
+    }
+
+    private fun initNativeHandleLocked(
+        choice: WhisperModelChoice,
+        modelFile: File,
+        failureStatus: String,
+        zeroHandleMessage: String,
+        suppressLoadErrorWhenNoContext: Boolean = false
+    ): Boolean = try {
+        if (!isJniLibraryLoaded) {
+            runCatching { System.loadLibrary("c++_shared") }
+            System.loadLibrary("whisper_jni")
+            isJniLibraryLoaded = true
+        }
+        val wantGpu = hardwareBackend != HardwareInferenceBackend.CPU
+        val handle = nativeInitWhisper(modelFile.absolutePath, wantGpu)
+        if (handle != 0L) {
+            sharedWhisperHandle = handle
+            sharedIsUsingGpu = runCatching { nativeIsUsingGpu(handle) }.getOrDefault(false)
+            _lastError.value = null
+            _memoryStatus.value = formatMemoryStatus()
+            true
+        } else {
+            sharedIsUsingGpu = false
+            _lastError.value = zeroHandleMessage
+            _memoryStatus.value = failureStatus
+            false
+        }
+    } catch (t: Throwable) {
+        sharedIsUsingGpu = false
+        if (!suppressLoadErrorWhenNoContext || context != null) {
+            _lastError.value = "Whisper error: ${t.message}"
+        }
+        _memoryStatus.value = failureStatus
+        false
     }
 
     private fun missingModelMessage(choice: WhisperModelChoice): String =
@@ -431,10 +493,12 @@ class WhisperMultilingualSttEngine(
         val ready = ensureNativeWhisperInitialized()
         if (!ready || sharedWhisperHandle == 0L) return@withContext ""
         whisperMutex.withLock {
+            val handle = sharedWhisperHandle
+            if (handle == 0L) return@withLock ""
             try {
                 val startMs = System.currentTimeMillis()
                 val rawLang = language.whisperCode
-                val rawResult = nativeTranscribePcm16(sharedWhisperHandle, samples, sampleCount, rawLang)
+                val rawResult = nativeTranscribePcm16(handle, samples, sampleCount, rawLang)
                 // Native result: "<detected language>\t<transcript>" (older builds return only the text).
                 val tab = rawResult.indexOf('\t')
                 val rawText = if (tab >= 0) rawResult.substring(tab + 1) else rawResult
@@ -452,9 +516,9 @@ class WhisperMultilingualSttEngine(
 
     internal fun cleanWhisperArtifacts(raw: String): String {
         val cleaned = raw
-            .replace(Regex("\\[.*?\\]"), "") // Strip [BLANK_AUDIO], [Music], [Silence]
-            .replace(Regex("\\(.*?\\)"), "") // Strip (inaudible), (sighs)
-            .replace(Regex("\\s+"), " ")
+            .replace(BRACKET_ARTIFACT_REGEX, "") // Strip [BLANK_AUDIO], [Music], [Silence]
+            .replace(PAREN_ARTIFACT_REGEX, "") // Strip (inaudible), (sighs)
+            .replace(MULTI_SPACE_REGEX, " ")
             .trim()
         return collapseRepeatedPhrase(cleaned)
     }
@@ -683,6 +747,7 @@ class WhisperMultilingualSttEngine(
             private set
 
         private var consecutiveSpeechFrames = 0
+        private var filteredBuffer = DoubleArray(1024)
 
         fun reset() {
             x1 = 0.0; x2 = 0.0; y1 = 0.0; y2 = 0.0
@@ -699,7 +764,10 @@ class WhisperMultilingualSttEngine(
             var prevFiltered = 0.0
             var peakAbs = 0
 
-            val filtered = DoubleArray(length)
+            if (filteredBuffer.size < length) {
+                filteredBuffer = DoubleArray(length)
+            }
+            val filtered = filteredBuffer
 
             for (i in 0 until length) {
                 val sample = pcm[i].toInt()
@@ -838,9 +906,12 @@ class WhisperMultilingualSttEngine(
         continuous: Boolean = false,
         onPartial: (String) -> Unit = {},
         onError: (String) -> Unit = {},
+        /** The caller needs words (translation, dictation into a loop): always transcribe with Whisper. */
+        transcriptNeeded: Boolean = false,
         onFinalResult: (String) -> Unit
     ) {
-        org.fossistant.assistant.util.AppLogger.i("WhisperEngine", "startListening: language=${language.code}, continuous=$continuous")
+        val sendAudio = audioToGemma && !transcriptNeeded
+        org.fossistant.assistant.util.AppLogger.i("WhisperEngine", "startListening: language=${language.code}, continuous=$continuous${if (sendAudio) ", audio to Gemma" else ""}")
         val appContext = context ?: run {
             onError("No Android Context available for microphone recording.")
             onFinalResult("")
@@ -881,7 +952,7 @@ class WhisperMultilingualSttEngine(
             }
             // Give VoiceWakeWordService time to release its background AudioRecord if it was holding the mic
             delay(60)
-            ensureNativeWhisperInitialized()
+            if (!sendAudio) ensureNativeWhisperInitialized()
 
             val minBufSize = AudioRecord.getMinBufferSize(SAMPLE_RATE_HZ, CHANNEL_CONFIG, AUDIO_FORMAT)
             val bufferSize = maxOf(minBufSize * 2, 8192)
@@ -889,6 +960,7 @@ class WhisperMultilingualSttEngine(
             var echoCanceler: AcousticEchoCanceler? = null
             var noiseSuppressor: NoiseSuppressor? = null
             var isCurrentlyDucked = false
+            var speculativeJob: Deferred<String>? = null
 
             suspend fun deliverStatus(status: String) {
                 _livePartial.value = status
@@ -970,9 +1042,9 @@ class WhisperMultilingualSttEngine(
                 var lastVoiceCandidateMs = 0L
                 var idleSinceMs = System.currentTimeMillis()
                 var lastStatusMs = 0L
+                val speechGate = SpeechLevelGate()
 
                 var speculativeRevision = -1
-                var speculativeJob: Deferred<String>? = null
 
                 val softwareAec = SoftwareAcousticEchoCanceler(playbackReferenceBuffer)
                 val vad = DeepVocalActivityDetector()
@@ -1039,12 +1111,14 @@ class WhisperMultilingualSttEngine(
                         utteranceVoicedMs = 0L
                         utterancePeakDb = 0f
                         utteranceStartedDuringEcho = echoGuard
+                        speechGate.reset()
                         hardInterruptSent = false
                     }
 
                     if (speechDetected) {
                         appendUtterance(pcmBuffer, readCount)
-                        if (isUserVoiceFrame) {
+                        val speakingNow = speechGate.isSpeaking(isUserVoiceFrame, vadResult.filteredRmsDb)
+                        if (speakingNow) {
                             lastVoiceMs = now
                             utteranceVoicedMs += frameMs
                             utterancePeakDb = maxOf(utterancePeakDb, vadResult.filteredRmsDb)
@@ -1071,7 +1145,7 @@ class WhisperMultilingualSttEngine(
                         val silenceMs = now - lastVoiceMs
                         // Early transcription: decode what we have shortly after the user pauses so the
                         // endpoint can use the actual words, and the final transcript is usually ready.
-                        if (!isUserVoiceFrame && silenceMs >= SPECULATIVE_DECODE_AFTER_MS &&
+                        if (!sendAudio && !speakingNow && silenceMs >= SPECULATIVE_DECODE_AFTER_MS &&
                             speculativeRevision != utteranceRevision && speculativeJob?.isActive != true
                         ) {
                             val snapshot = fullAudioSamples.copyOf(totalSamples)
@@ -1083,13 +1157,16 @@ class WhisperMultilingualSttEngine(
                             ?.takeIf { speculativeRevision == utteranceRevision && it.isCompleted && !it.isCancelled }
                             ?.getCompleted()
                             ?.let { cleanWhisperArtifacts(it) }
-                        val endpointTimeout = computeDynamicSilenceTimeout(speculativeText.orEmpty())
-                        val isSilenceExceeded = !isUserVoiceFrame && silenceMs > endpointTimeout
+                        val endpointTimeout = if (sendAudio) GEMMA_END_OF_SPEECH_MS else computeDynamicSilenceTimeout(speculativeText.orEmpty())
+                        val isSilenceExceeded = !speakingNow && silenceMs > endpointTimeout
                         val isMaxDurationReached = totalSamples >= SAMPLE_RATE_HZ * 20
 
                         if (isSilenceExceeded || isMaxDurationReached) {
                             val revision = utteranceRevision
                             val reusable = speculativeJob?.takeIf { speculativeRevision == revision && !isMaxDurationReached }
+                            if (reusable == null) {
+                                speculativeJob?.cancel()
+                            }
                             val voicedMs = utteranceVoicedMs
                             val noiseFloorDb = vad.ambientNoiseFloorDb
                             val snrDb = utterancePeakDb - noiseFloorDb
@@ -1120,6 +1197,22 @@ class WhisperMultilingualSttEngine(
                                     "WhisperEngine",
                                     "Utterance: ${voicedMs} ms, peak ${"%.1f".format(utterancePeakDb)} dB, ${"%.1f".format(snrDb)} dB above the noise"
                                 )
+                                if (sendAudio) {
+                                    deliverStatus("Sending your voice to Gemma...")
+                                    launch(ioDispatcher) {
+                                        handleVoiceAudio(
+                                            sessionId = sessionId,
+                                            voicedMs = voicedMs,
+                                            samples = samplesToDecode!!,
+                                            interruptAlreadySent = interruptAlreadySent,
+                                            wasDucked = wasDucked,
+                                            onPartial = onPartial,
+                                            onFinalResult = onFinalResult
+                                        )
+                                    }
+                                    if (!continuous) break
+                                    continue
+                                }
                                 deliverStatus("Transcribing with Whisper...")
                                 launch(ioDispatcher) {
                                     val transcript = reusable?.await()
@@ -1138,7 +1231,7 @@ class WhisperMultilingualSttEngine(
                                 if (!continuous) break
                             } else {
                                 if (wasDucked) onBargeInCleared?.invoke()
-                                deliverStatus("Listening with Whisper...")
+                                deliverStatus(if (sendAudio) "Listening..." else "Listening with Whisper...")
                             }
                         }
                     } else {
@@ -1177,6 +1270,7 @@ class WhisperMultilingualSttEngine(
                     }
                 }
             } finally {
+                speculativeJob?.cancel()
                 if (isCurrentlyDucked) {
                     onBargeInCleared?.invoke()
                 }
@@ -1213,6 +1307,97 @@ class WhisperMultilingualSttEngine(
         }
     }
 
+    /**
+     * The speech gate: follows how loud the user speaks during an utterance, and counts a frame far below that
+     * level as quiet even when the voice detector still hears "voice" (a TV, traffic, a fan, room echo). So
+     * background sound can't hold the microphone open, while a speaker who trails off a little still counts.
+     */
+    class SpeechLevelGate(
+        private val dropDb: Float = SPEECH_GATE_DROP_DB,
+        private val minFrames: Int = 4
+    ) {
+        private var levelDb = 0f
+        private var frames = 0
+
+        fun reset() {
+            levelDb = 0f
+            frames = 0
+        }
+
+        /** True when this frame is the user still speaking (and then it updates their level). */
+        fun isSpeaking(isVoice: Boolean, frameDb: Float): Boolean {
+            if (!isVoice) return false
+            if (frames >= minFrames && frameDb < levelDb - dropDb) return false
+            levelDb = if (frames == 0) frameDb else levelDb * 0.9f + frameDb * 0.1f
+            frames++
+            return true
+        }
+    }
+
+    /**
+     * Gemma voice input: the utterance goes to the chat as a WAV recording. There are no words to check, so
+     * only the length rule applies (short sounds during an answer are ignored); echo and backchannel
+     * filtering rely on the voice detector alone.
+     */
+    private suspend fun handleVoiceAudio(
+        sessionId: Long,
+        voicedMs: Long,
+        samples: ShortArray,
+        interruptAlreadySent: Boolean,
+        wasDucked: Boolean,
+        onPartial: (String) -> Unit,
+        onFinalResult: (String) -> Unit
+    ) {
+        if (!interruptAlreadySent && voicedMs < BUSY_MIN_VOICED_MS && isAssistantBusyProvider?.invoke() == true) {
+            org.fossistant.assistant.util.AppLogger.i("WhisperEngine", "Ignored short speech during the answer (${voicedMs} ms)")
+            if (wasDucked) onBargeInCleared?.invoke()
+            withContext(Dispatchers.Main) {
+                if (isCurrentSession(sessionId)) {
+                    _livePartial.value = "Listening..."
+                    onPartial("Listening...")
+                }
+            }
+            return
+        }
+        val clip = runCatching { saveVoiceClip(samples) }
+            .onFailure { org.fossistant.assistant.util.AppLogger.w("WhisperEngine", "Couldn't save the voice clip: ${it.message}") }
+            .getOrNull() ?: return
+        val ttsPlayingNow = isTtsSpeakingProvider?.invoke() ?: false
+        withContext(Dispatchers.Main) {
+            if (!isCurrentSession(sessionId)) return@withContext
+            if (ttsPlayingNow && !interruptAlreadySent) {
+                onUserInterruption?.invoke()
+            } else if (wasDucked) {
+                onBargeInCleared?.invoke()
+            }
+            _livePartial.value = ""
+            org.fossistant.assistant.util.AppLogger.i("WhisperEngine", "Voice clip for Gemma: ${voicedMs} ms of speech, ${samples.size / SAMPLE_RATE_HZ.toFloat()} s recorded")
+            onFinalResult(VOICE_AUDIO_PREFIX + clip.absolutePath)
+        }
+    }
+
+    /** Writes [samples] as a 16 kHz mono WAV in the cache, keeping only the most recent clips. */
+    private fun saveVoiceClip(samples: ShortArray): File {
+        val dir = File(context!!.cacheDir, "voice_clips").apply { mkdirs() }
+        dir.listFiles()?.sortedByDescending { it.lastModified() }?.drop(MAX_VOICE_CLIPS - 1)?.forEach { it.delete() }
+        val file = File(dir, "voice-${System.currentTimeMillis()}.wav")
+        file.writeBytes(pcm16ToWav(samples, samples.size, SAMPLE_RATE_HZ))
+        return file
+    }
+
+    /** Frees Whisper's memory; it loads again the next time something needs a transcript. */
+    suspend fun releaseWhisper() = withContext(ioDispatcher) {
+        whisperMutex.withLock {
+            if (sharedWhisperHandle != 0L) {
+                runCatching { nativeFreeWhisper(sharedWhisperHandle) }
+                sharedWhisperHandle = 0L
+                sharedIsUsingGpu = false
+                _memoryStatus.value = "Standby (${activeModel.ramBadge})"
+                org.fossistant.assistant.util.AppLogger.i("WhisperEngine", "Whisper unloaded (voice goes to Gemma)")
+            }
+        }
+    }
+
     private suspend fun handleTranscript(
         sessionId: Long,
         voicedMs: Long,
@@ -1224,7 +1409,7 @@ class WhisperMultilingualSttEngine(
         onFinalResult: (String) -> Unit
     ) {
         val cleaned = cleanWhisperArtifacts(rawTranscript)
-        val autocorrected = if (isWhisperHallucination(cleaned)) "" else FuzzyAppAndCommandMatcher.autocorrectTranscript(cleaned)
+        val finalTranscript = if (isWhisperHallucination(cleaned)) "" else cleaned
 
         suspend fun dropAndResume(reason: String?) {
             if (reason != null) org.fossistant.assistant.util.AppLogger.i("WhisperEngine", reason)
@@ -1237,33 +1422,33 @@ class WhisperMultilingualSttEngine(
             }
         }
 
-        if (autocorrected.isBlank()) {
+        if (finalTranscript.isBlank()) {
             dropAndResume(null)
             return
         }
 
         // While an answer is being written or spoken, only about a second or more of real speech counts.
         if (!interruptAlreadySent && voicedMs < BUSY_MIN_VOICED_MS && isAssistantBusyProvider?.invoke() == true) {
-            dropAndResume("Ignored short speech during the answer (${voicedMs} ms): '${org.fossistant.assistant.util.AppLogger.userText(autocorrected)}'")
+            dropAndResume("Ignored short speech during the answer (${voicedMs} ms): '${org.fossistant.assistant.util.AppLogger.userText(finalTranscript)}'")
             return
         }
 
         // Hesitations ("um", "hmm") would otherwise cancel the answer being written or spoken and become a prompt.
-        if (isFillerUtterance(autocorrected)) {
-            dropAndResume("Ignored filler: '${org.fossistant.assistant.util.AppLogger.userText(autocorrected)}'")
+        if (isFillerUtterance(finalTranscript)) {
+            dropAndResume("Ignored filler: '${org.fossistant.assistant.util.AppLogger.userText(finalTranscript)}'")
             return
         }
 
         // 1. Self-echo rejection: the assistant's own words picked up by the microphone.
-        if ((startedDuringEcho || interruptAlreadySent) && isSelfEchoChecker?.invoke(autocorrected) == true) {
-            dropAndResume("Suppressed self-echo transcript: '${org.fossistant.assistant.util.AppLogger.userText(autocorrected)}'")
+        if ((startedDuringEcho || interruptAlreadySent) && isSelfEchoChecker?.invoke(finalTranscript) == true) {
+            dropAndResume("Suppressed self-echo transcript: '${org.fossistant.assistant.util.AppLogger.userText(finalTranscript)}'")
             return
         }
 
         // 2. Conversational backchannel while the assistant keeps talking ("yeah", "ok", "mhm").
         val ttsPlayingNow = isTtsSpeakingProvider?.invoke() ?: false
-        if (ttsPlayingNow && !interruptAlreadySent && isBackchannelUtterance(autocorrected)) {
-            dropAndResume("Ignored conversational backchannel: '${org.fossistant.assistant.util.AppLogger.userText(autocorrected)}'")
+        if (ttsPlayingNow && !interruptAlreadySent && isBackchannelUtterance(finalTranscript)) {
+            dropAndResume("Ignored conversational backchannel: '${org.fossistant.assistant.util.AppLogger.userText(finalTranscript)}'")
             return
         }
 
@@ -1274,9 +1459,9 @@ class WhisperMultilingualSttEngine(
             } else if (wasDucked) {
                 onBargeInCleared?.invoke()
             }
-            org.fossistant.assistant.util.AppLogger.i("WhisperEngine", "Transcribed: '${org.fossistant.assistant.util.AppLogger.userText(autocorrected)}'")
-            onPartial(autocorrected)
-            onFinalResult(autocorrected)
+            org.fossistant.assistant.util.AppLogger.i("WhisperEngine", "Transcribed: '${org.fossistant.assistant.util.AppLogger.userText(finalTranscript)}'")
+            onPartial(finalTranscript)
+            onFinalResult(finalTranscript)
         }
     }
 

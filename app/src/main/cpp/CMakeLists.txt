@@ -13,15 +13,19 @@ set(WHISPER_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 # ggml's own thread pool; avoids shipping an OpenMP runtime.
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
+# Vulkan: GPU acceleration across Adreno/Mali with automatic CPU fallback.
+set(GGML_VULKAN ON CACHE BOOL "" FORCE)
 if (ANDROID_ABI STREQUAL "arm64-v8a")
     # dotprod + fp16 arithmetic: available on practically every arm64 phone since 2018 (Cortex-A55/A75+).
     set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
 endif()
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 add_subdirectory(${WHISPER_CPP_DIR} whisper_build EXCLUDE_FROM_ALL)
 
 add_library(whisper_jni SHARED whisper_jni.cpp)
-target_link_libraries(whisper_jni PRIVATE whisper log)
+target_link_libraries(whisper_jni PRIVATE whisper ggml log android)
 target_compile_options(whisper_jni PRIVATE -O3)
 target_link_options(whisper_jni PRIVATE
     -Wl,--gc-sections

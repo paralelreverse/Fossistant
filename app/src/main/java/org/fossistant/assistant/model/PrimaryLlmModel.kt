@@ -3,20 +3,16 @@ package org.fossistant.assistant.model
 /**
  * Inference runtime for a primary model.
  * - [LITERT_LM]: Google LiteRT-LM (`.litertlm` bundles), GPU via OpenCL / ML Drift.
- * - [LLAMA_CPP]: llama.cpp (`.gguf`), GPU via Vulkan with CPU fallback.
  */
 enum class LlmRuntimeEngine(val badge: String) {
-    LITERT_LM("LiteRT"),
-    LLAMA_CPP("llama.cpp")
+    LITERT_LM("LiteRT")
 }
 
 /**
  * How a model file gets onto the device.
  * - [BUNDLED]: inside the full APK; unpacked to private storage on first launch and reused by slim updates.
- * - [IMPORTED]: not in the full APK (the APK limit is ~4 GB). Copied once from a file the user picks or pushed
- *   with adb; kept across app updates. (No model uses this right now.)
  */
-enum class ModelDelivery { BUNDLED, IMPORTED }
+enum class ModelDelivery { BUNDLED }
 
 /**
  * Primary on-device language models. New, more capable small models only need an entry here: the runtime,
@@ -35,11 +31,12 @@ enum class PrimaryLlmModel(
     val delivery: ModelDelivery = ModelDelivery.BUNDLED,
     val supportsTools: Boolean = true,
     /**
-     * The context window starts at [startContextTokens] and doubles whenever less than 2K tokens are free, up to
-     * [maxContextTokens] (and 16K on phones with less than 12 GB of RAM). It starts at 16K because the system
-     * prompt now carries every installed app's actions (often 1-3K tokens) and still leaves room for the chat.
+     * The context window starts at [startContextTokens] (8K by default, leaving ample room past the system prompt
+     * and tool schemas without an immediate first-turn reload while keeping KV-cache allocation half of 16K), and
+     * doubles automatically whenever less than 2K tokens remain free, up to [maxContextTokens] (16K on <12 GB RAM,
+     * 32K otherwise).
      */
-    val startContextTokens: Int = 16384,
+    val startContextTokens: Int = 8192,
     val maxContextTokens: Int = 32768,
     /** Where to get the file (shown when it has to be imported). */
     val sourceUrl: String = "",

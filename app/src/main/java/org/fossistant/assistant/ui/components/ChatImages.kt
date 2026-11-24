@@ -32,6 +32,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -44,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.fossistant.assistant.model.MediaAttachment
 import java.io.File
@@ -67,6 +69,7 @@ fun ChatImages(
 @Composable
 private fun ChatImage(attachment: MediaAttachment, accent: Color, canSave: Boolean) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val bitmap by produceState<Bitmap?>(initialValue = null, attachment.uriString) {
         value = withContext(Dispatchers.IO) { decodeThumbnail(context, attachment.uriString, 720) }
     }
@@ -96,7 +99,7 @@ private fun ChatImage(attachment: MediaAttachment, accent: Color, canSave: Boole
         }
         if (canSave && image != null) {
             Row(modifier = Modifier.padding(top = 6.dp)) {
-                ImageAction(Icons.Filled.Download, "Save", accent) { saveToGallery(context, attachment) }
+                ImageAction(Icons.Filled.Download, "Save", accent) { scope.launch { saveToGallery(context, attachment) } }
                 Spacer(Modifier.width(8.dp))
                 ImageAction(Icons.Filled.Share, "Share", accent) { shareImage(context, attachment) }
             }
@@ -174,16 +177,18 @@ private fun shareImage(context: Context, attachment: MediaAttachment) {
     }
 }
 
-private fun saveToGallery(context: Context, attachment: MediaAttachment) {
-    val file = localFile(attachment.uriString)?.takeIf { it.exists() } ?: return
-    val saved = runCatching {
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME, file.name)
-            put(MediaStore.Images.Media.MIME_TYPE, attachment.mimeType.ifBlank { "image/png" })
-            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Fossistant")
-        }
-        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: error("no uri")
-        context.contentResolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } }
-    }.isSuccess
+private suspend fun saveToGallery(context: Context, attachment: MediaAttachment) {
+    val saved = withContext(Dispatchers.IO) {
+        val file = localFile(attachment.uriString)?.takeIf { it.exists() } ?: return@withContext null
+        runCatching {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, file.name)
+                put(MediaStore.Images.Media.MIME_TYPE, attachment.mimeType.ifBlank { "image/png" })
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Fossistant")
+            }
+            val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: error("no uri")
+            context.contentResolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } }
+        }.isSuccess
+    } ?: return
     Toast.makeText(context, if (saved) "Saved to Pictures/Fossistant" else "Couldn't save the picture", Toast.LENGTH_SHORT).show()
 }
